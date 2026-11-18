@@ -7,6 +7,7 @@ cd "$(dirname "$0")/.."
 SOURCES=(
   Clarion/AMF0.swift
   Clarion/FLV.swift
+  Clarion/RTMPChunk.swift
 )
 
 mkdir -p build

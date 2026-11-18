@@ -28,6 +28,7 @@ func expect(_ condition: Bool, _ message: String = "", line: UInt = #line) throw
 private let checkGroups: [() -> Void] = [
     amf0Checks,
     flvChecks,
+    rtmpChunkChecks,
 ]
 
 @main
