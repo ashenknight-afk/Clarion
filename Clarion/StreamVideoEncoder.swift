@@ -42,67 +42,174 @@ final class StreamVideoEncoder {
         return status == noErr ? session : nil
     }
 
+    /// State the session's callback shares with the encoder. The callback holds this, never the
+    /// encoder, so the last reference to the encoder can be dropped on any thread, including the
+    /// VideoToolbox one.
+    private final class Output {
+        /// Recursive so `onFrame` may call back into the encoder.
+        let lock = NSRecursiveLock()
+        let onFrame: (Frame) -> Void
+        var closed = false
+        var dropped = 0
+        var inFlight = 0
+        /// Recent output as (presentation seconds, bytes), for the rate guard.
+        var window: [(time: Double, bytes: Int)] = []
+        var windowBytes = 0
+        init(onFrame: @escaping (Frame) -> Void) { self.onFrame = onFrame }
+
+        static let callbackKey = "StreamVideoEncoder.callback"
+    }
+
     private let lock = NSLock()
     private var session: VTCompressionSession?
-    private let onFrame: (Frame) -> Void
+    private let output: Output
+    /// Bytes per second the guard lets through before it drops input (1.2x the target).
+    private let guardBytesPerSecond: Double
+
+    /// Frames not encoded: refused by the session, failed or empty in the callback, or dropped
+    /// by the rate guard.
+    var droppedFrames: Int {
+        output.lock.lock()
+        defer { output.lock.unlock() }
+        return output.dropped
+    }
 
     init?(width: Int, height: Int, bitrate: Int, frameRate: Int, onFrame: @escaping (Frame) -> Void) {
         guard let session = Self.makeSession(width: width, height: height) else { return nil }
-        self.session = session
-        self.onFrame = onFrame
+        output = Output(onFrame: onFrame)
+        guardBytesPerSecond = Double(bitrate) * 1.2 / 8
 
-        func set(_ key: CFString, _ value: Any) {
-            VTSessionSetProperty(session, key: key, value: value as CFTypeRef)
+        func set(_ key: CFString, _ value: Any) -> Bool {
+            VTSessionSetProperty(session, key: key, value: value as CFTypeRef) == noErr
         }
-        set(kVTCompressionPropertyKey_RealTime, true)
-        set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel)
-        set(kVTCompressionPropertyKey_AllowFrameReordering, false)
-        set(kVTCompressionPropertyKey_MaxKeyFrameInterval, 2 * frameRate)
-        set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, 2)
-        set(kVTCompressionPropertyKey_AverageBitRate, bitrate)
+        // The hardware encoder treats the data rate limit as a hint and overshoots on busy
+        // pictures (measured), so the guard in `encode` is what holds the rate. The limit and the
+        // key frame duration are still set, but a Mac that rejects them is not refused.
+        let required = set(kVTCompressionPropertyKey_RealTime, true)
+            && set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel)
+            && set(kVTCompressionPropertyKey_AllowFrameReordering, false)
+            && set(kVTCompressionPropertyKey_MaxKeyFrameInterval, 2 * frameRate)
+            && set(kVTCompressionPropertyKey_AverageBitRate, bitrate)
+            && set(kVTCompressionPropertyKey_ExpectedFrameRate, frameRate)
+        _ = set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, 2)
         // Bytes per second: 1.2x the average, over a 1 s window.
-        set(kVTCompressionPropertyKey_DataRateLimits, [Double(bitrate) * 1.2 / 8, 1.0])
-        set(kVTCompressionPropertyKey_ExpectedFrameRate, frameRate)
-        guard VTCompressionSessionPrepareToEncodeFrames(session) == noErr else {
+        _ = set(kVTCompressionPropertyKey_DataRateLimits, [Double(bitrate) * 1.2 / 8, 1.0])
+        guard required, VTCompressionSessionPrepareToEncodeFrames(session) == noErr else {
             VTCompressionSessionInvalidate(session)
-            self.session = nil
             return nil
         }
+        self.session = session
     }
 
-    deinit { invalidate() }
+    deinit {
+        // Never block here: the owner may be any thread.
+        lock.lock()
+        let session = self.session
+        self.session = nil
+        lock.unlock()
+        guard let session else { return }
+        close(then: session)
+    }
 
-    func encode(_ buffer: CVPixelBuffer, at time: CMTime, forceKeyframe: Bool = false) {
+    /// Returns false when the frame was not accepted (counted in `droppedFrames`).
+    @discardableResult
+    func encode(_ buffer: CVPixelBuffer, at time: CMTime, forceKeyframe: Bool = false) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard let session else { return }
+        guard let session else { return false }
+        let seconds = time.seconds
+        let output = self.output
+
+        output.lock.lock()
+        if output.closed { output.lock.unlock(); return false }
+        while let first = output.window.first, first.time <= seconds - 1 {
+            output.windowBytes -= first.bytes
+            output.window.removeFirst()
+        }
+        // Frames still in the encoder count at the largest recent size. Until the first output
+        // shows what a frame costs, only a few may be in flight.
+        let largest = output.window.map(\.bytes).max() ?? 0
+        let projected = Double(output.windowBytes + output.inFlight * largest)
+        if projected > guardBytesPerSecond || (output.window.isEmpty && output.inFlight >= 6) {
+            output.dropped += 1
+            output.lock.unlock()
+            return false
+        }
+        output.inFlight += 1
+        output.lock.unlock()
+
         let properties: CFDictionary? = forceKeyframe ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
-        // The handler runs on VideoToolbox's thread. invalidate() drains it before clearing `session`.
-        VTCompressionSessionEncodeFrame(
+        // The handler runs on VideoToolbox's thread.
+        let status = VTCompressionSessionEncodeFrame(
             session, imageBuffer: buffer, presentationTimeStamp: time, duration: .invalid,
             frameProperties: properties, infoFlagsOut: nil
-        ) { [weak self] status, _, sample in
-            guard status == noErr, let sample, let self else { return }
-            self.emit(sample)
+        ) { status, _, sample in
+            Self.handle(status: status, sample: sample, output: output)
         }
+        if status != noErr {
+            // The handler is not called when the call itself fails.
+            output.lock.lock()
+            output.inFlight -= 1
+            output.dropped += 1
+            output.lock.unlock()
+            return false
+        }
+        return true
     }
 
     /// Completes pending frames, then tears the session down. No output follows its return.
     func invalidate() {
         lock.lock()
-        defer { lock.unlock() }
-        guard let session else { return }
-        VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+        let session = self.session
         self.session = nil
+        lock.unlock()
+        guard let session else { return }
+        if Thread.current.threadDictionary[Output.callbackKey] != nil {
+            // Called from onFrame: waiting for the session here would wait on ourselves.
+            close(then: session)
+            return
+        }
+        VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+        output.lock.lock()
+        output.closed = true
+        output.lock.unlock()
         VTCompressionSessionInvalidate(session)
     }
 
-    private func emit(_ sample: CMSampleBuffer) {
-        guard let block = CMSampleBufferGetDataBuffer(sample) else { return }
+    /// Stops output now and finishes the session off the calling thread.
+    private func close(then session: VTCompressionSession) {
+        output.lock.lock()
+        output.closed = true
+        output.lock.unlock()
+        DispatchQueue.global(qos: .utility).async {
+            VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+            VTCompressionSessionInvalidate(session)
+        }
+    }
+
+    private static func handle(status: OSStatus, sample: CMSampleBuffer?, output: Output) {
+        output.lock.lock()
+        defer { output.lock.unlock() }
+        output.inFlight -= 1
+        guard status == noErr, let sample, let frame = makeFrame(sample) else {
+            output.dropped += 1
+            return
+        }
+        output.window.append((frame.time.seconds, frame.avcc.count))
+        output.windowBytes += frame.avcc.count
+        if output.closed { return }
+        let marker = Thread.current.threadDictionary
+        marker[Output.callbackKey] = true
+        output.onFrame(frame)
+        marker.removeObject(forKey: Output.callbackKey)
+    }
+
+    private static func makeFrame(_ sample: CMSampleBuffer) -> Frame? {
+        guard let block = CMSampleBufferGetDataBuffer(sample) else { return nil }
         var length = 0
         var pointer: UnsafeMutablePointer<CChar>?
         guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &pointer) == kCMBlockBufferNoErr,
-              let pointer else { return }
+              let pointer else { return nil }
         let avcc = Data(bytes: pointer, count: length)
 
         var keyframe = true
@@ -117,7 +224,7 @@ final class StreamVideoEncoder {
             sps = Self.parameterSet(format, index: 0)
             pps = Self.parameterSet(format, index: 1)
         }
-        onFrame(Frame(avcc: avcc, keyframe: keyframe, time: CMSampleBufferGetPresentationTimeStamp(sample), sps: sps, pps: pps))
+        return Frame(avcc: avcc, keyframe: keyframe, time: CMSampleBufferGetPresentationTimeStamp(sample), sps: sps, pps: pps)
     }
 
     private static func parameterSet(_ format: CMFormatDescription, index: Int) -> Data? {
