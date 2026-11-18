@@ -8,6 +8,7 @@ SOURCES=(
   Clarion/AMF0.swift
   Clarion/FLV.swift
   Clarion/RTMPChunk.swift
+  Clarion/RTMPConnection.swift
 )
 
 mkdir -p build

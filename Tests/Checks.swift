@@ -29,6 +29,7 @@ private let checkGroups: [() -> Void] = [
     amf0Checks,
     flvChecks,
     rtmpChunkChecks,
+    rtmpConnectionChecks,
 ]
 
 @main
