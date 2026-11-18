@@ -53,7 +53,7 @@ final class StreamVideoEncoder {
         var dropped = 0
         var inFlight = 0
         /// Recent output as (presentation seconds, bytes), for the rate guard.
-        var window: [(time: Double, bytes: Int)] = []
+        var window: [(time: Double, bytes: Int, keyframe: Bool)] = []
         var windowBytes = 0
         var largestKeyframe = 0
         var lastKeyframeTime: Double?
@@ -137,9 +137,10 @@ final class StreamVideoEncoder {
             output.window.removeFirst()
         }
         let keyframe = forceKeyframe || output.keyframePending
-        // Cost of this frame and those still in the encoder: the largest recent frame each, and
+        // Cost of this frame and those still in the encoder: the largest recent delta frame each
+        // (a keyframe in the window would make every in-flight frame cost a keyframe), and
         // for a keyframe (forced or due, the interval being 2 s) the largest keyframe seen.
-        let largest = output.window.map(\.bytes).max() ?? 0
+        let largest = output.window.lazy.filter { !$0.keyframe }.map(\.bytes).max() ?? 0
         let keyframeDue = output.lastKeyframeTime.map { seconds - $0 >= 1.9 } ?? false
         let candidate = keyframe || keyframeDue ? max(largest, output.largestKeyframe) : largest
         let projected = Double(output.windowBytes + output.inFlight * largest + candidate)
@@ -217,7 +218,7 @@ final class StreamVideoEncoder {
             output.lock.unlock()
             return
         }
-        output.window.append((frame.time.seconds, frame.avcc.count))
+        output.window.append((frame.time.seconds, frame.avcc.count, frame.keyframe))
         output.windowBytes += frame.avcc.count
         if frame.keyframe {
             output.largestKeyframe = max(output.largestKeyframe, frame.avcc.count)
