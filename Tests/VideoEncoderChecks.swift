@@ -47,6 +47,11 @@ private func movingBuffer(from row: [UInt8], index: Int) -> CVPixelBuffer? {
     return buffer
 }
 
+private func waitUntil(timeout: TimeInterval, _ condition: () -> Bool) {
+    let end = Date().addingTimeInterval(timeout)
+    while !condition() && Date() < end { Thread.sleep(forTimeInterval: 0.002) }
+}
+
 private struct Run {
     let frames: [StreamVideoEncoder.Frame]
     let dropped: Int
@@ -78,6 +83,8 @@ private func encodeRun(count: Int, bitrate: Int = 6_000_000, noiseShift: UInt32,
         // Capture arrives every 16 ms; a little pacing keeps the checks short but not a flood.
         Thread.sleep(forTimeInterval: 0.004)
         encoder.encode(buffer, at: CMTime(value: CMTimeValue(i), timescale: 60), forceKeyframe: i == forceKeyframeAt)
+        // The first frame's latency is the encoder's warm-up, not steady state: wait it out.
+        if i == 0 { waitUntil(timeout: 3) { !log.frames.isEmpty } }
     }
     encoder.invalidate()
     return Run(frames: log.frames, dropped: encoder.droppedFrames)
@@ -163,6 +170,51 @@ func videoEncoderChecks() {
             done.signal()
         }
         try expect(done.wait(timeout: .now() + 20) == .success, "timed out")
+    }
+
+    check("onFrame invalidating while another thread encodes does not deadlock") {
+        let done = DispatchSemaphore(value: 0)
+        let row = noiseRow(noiseShift: 31)
+        DispatchQueue.global().async {
+            for _ in 0..<10 {
+                var encoder: StreamVideoEncoder?
+                encoder = StreamVideoEncoder(width: width, height: height, bitrate: 6_000_000, frameRate: 60, onFrame: { _ in
+                    encoder?.invalidate()
+                })
+                // Keep encoding while the first output invalidates the encoder.
+                for i in 0..<30 {
+                    if let buffer = movingBuffer(from: row, index: i) {
+                        encoder?.encode(buffer, at: CMTime(value: CMTimeValue(i), timescale: 60))
+                    }
+                }
+                encoder?.invalidate()
+                encoder = nil
+            }
+            done.signal()
+        }
+        try expect(done.wait(timeout: .now() + 20) == .success, "timed out")
+    }
+
+    check("a keyframe the guard dropped is delivered on the next frame") {
+        // Busy input so the guard is dropping; ask for a keyframe on every dropped-prone frame.
+        let log = FrameLog()
+        guard let encoder = StreamVideoEncoder(width: width, height: height, bitrate: 6_000_000, frameRate: 60, onFrame: { log.add($0) }) else { throw CheckFailure(description: "encoder not created") }
+        let row = noiseRow(noiseShift: 26)
+        var refused = -1
+        for i in 0..<240 {
+            let buffer = try movingBuffer(from: row, index: i).unwrapped("no buffer")
+            if i == 0 { encoder.encode(buffer, at: .zero); waitUntil(timeout: 3) { !log.frames.isEmpty }; continue }
+            let accepted = encoder.encode(buffer, at: CMTime(value: CMTimeValue(i), timescale: 60), forceKeyframe: refused < 0)
+            if !accepted && refused < 0 { refused = i }
+            if accepted && refused >= 0 {
+                encoder.invalidate()
+                let frame = log.frames.last
+                try expect(frame?.time == CMTime(value: CMTimeValue(i), timescale: 60) && frame?.keyframe == true, "kept request not applied")
+                return
+            }
+        }
+        try expect(refused >= 0, "guard never dropped a frame")
+        throw CheckFailure(description: "no frame admitted after the dropped keyframe request")
     }
 
     check("onFrame may invalidate its own encoder") {
