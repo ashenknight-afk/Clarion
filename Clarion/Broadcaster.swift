@@ -288,6 +288,8 @@ final class Broadcaster: ObservableObject {
             return
         }
         micMuted = false
+        // Sound still arriving from it would start the mic's track again.
+        micSource.onSamples = nil
         queue.async { self.mixer?.remove(.mic) }
     }
 

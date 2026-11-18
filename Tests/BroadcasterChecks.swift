@@ -177,9 +177,9 @@ private final class FakeMic: MicSource {
         queue.sync { timer?.cancel(); timer = nil }
     }
 
-    /// The microphone goes away: no more sound, and the state says so.
+    /// The microphone reports that it is gone.
     func disconnect() {
-        queue.sync { timer?.cancel(); timer = nil }
+        // Keeps sending, as a device that is going away can for a moment: the broadcaster must drop it.
         onState?(.unavailable("Stand-in"))
     }
 }
@@ -635,13 +635,15 @@ func broadcasterChecks() {
         let mic = FakeMic()
         broadcaster.micSource = mic
         let blocks = Locked<[[Float]]>([])
-        broadcaster.onSoundBlock = { samples, _ in blocks.update { $0.append(samples) } }
+        let timed = Locked<[(samples: [Float], time: Double)]>([])
+        broadcaster.onSoundBlock = { samples, time in blocks.update { $0.append(samples) }; timed.update { $0.append((samples, time)) } }
         guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
         feeder.start()
         defer { feeder.stop() }
         broadcaster.goLive(micConfig(port: server.port))
         try expect(spin(timeout: 5) { broadcaster.states[.twitch] == .live }, "not live")
         spin(timeout: 1)
+        let gone = CACurrentMediaTime()
         mic.disconnect()
         try expect(spin(timeout: 2) { broadcaster.notice == "Microphone disconnected" }, "notice \(broadcaster.notice ?? "nil")")
         try expect(broadcaster.micState == .unavailable("Stand-in"), "state \(broadcaster.micState)")
@@ -650,11 +652,39 @@ func broadcasterChecks() {
         let after = server.received.filter { $0.type == 8 }.count
         try expect(broadcaster.states[.twitch] == .live && broadcaster.isLive, "no longer live")
         try expect(after - before >= 30, "only \(after - before) audio messages in 1.5 s")
-        // Past the mixer's delay the microphone's queued sound is gone; the game is still there.
+        // The mixer holds back 0.1 s: sound queued from the microphone before it went is still waiting,
+        // and has to be cut. These blocks end shortly before the microphone went, so they would carry it.
+        let queued = timed.value.filter { $0.time >= gone - 0.09 && $0.time <= gone - 0.055 }.map(\.samples)
+        try expect(!queued.isEmpty, "no block in the window")
+        try expect(toneLevel(queued, frequency: 440) > 0.15, "game tone \(toneLevel(queued, frequency: 440))")
+        try expect(toneLevel(queued, frequency: 1000) < 0.03, "queued mic tone kept \(toneLevel(queued, frequency: 1000))")
         let tail = Array(blocks.value.suffix(15))
-        try expect(toneLevel(tail, frequency: 440) > 0.15, "game tone \(toneLevel(tail, frequency: 440))")
-        try expect(toneLevel(tail, frequency: 1000) < 0.03, "mic tone after it left \(toneLevel(tail, frequency: 1000))")
+        try expect(toneLevel(tail, frequency: 440) > 0.15, "game tone later \(toneLevel(tail, frequency: 440))")
+        try expect(toneLevel(tail, frequency: 1000) < 0.03, "mic tone later \(toneLevel(tail, frequency: 1000))")
         try ends(broadcaster)
+    }
+
+    check("the voice-processing tap's first channel goes to both sides") {
+        guard let layout = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | 3),
+              let buffer = AVAudioPCMBuffer(pcmFormat: AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000,
+                                                                     interleaved: false, channelLayout: layout),
+                                            frameCapacity: 960) else { throw CheckFailure(description: "no buffer") }
+        buffer.frameLength = 960
+        for i in 0..<960 {
+            buffer.floatChannelData![0][i] = Float(0.3 * sin(2 * Double.pi * 1000 * Double(i) / 48_000))
+            buffer.floatChannelData![1][i] = 0
+            buffer.floatChannelData![2][i] = 0.2
+        }
+        guard let mono = MicInput.firstChannel(of: buffer),
+              let samples = PCMNormalizer().samples(from: mono) else { throw CheckFailure(description: "no conversion") }
+        try expect(samples.count == 1920, "\(samples.count) values")
+        var differ = 0, loud: Float = 0
+        for i in 0..<960 {
+            if samples[i * 2] != samples[i * 2 + 1] { differ += 1 }
+            loud = max(loud, abs(samples[i * 2]))
+        }
+        try expect(differ == 0, "\(differ) frames differ between left and right")
+        try expect(loud > 0.25, "peak \(loud)")
     }
 
     check("a stream without a microphone setting never starts one") {
