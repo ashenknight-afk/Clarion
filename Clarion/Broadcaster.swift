@@ -88,8 +88,10 @@ final class Broadcaster: ObservableObject {
     var onWantsFrames: ((Bool) -> Void)?
     /// Main thread: ask the source for its sound while live.
     var onWantsAudio: ((Bool) -> Void)?
-    /// Queue: the camera's newest picture, drawn in a corner when the config has a camera. Set before `goLive`.
-    var cameraFrame: (() -> CVPixelBuffer?)?
+    /// The webcam, shared with the preview in Settings.
+    let camera = CameraFeed()
+    /// Checks only: stands in for the webcam. Set before `goLive`.
+    var cameraSource: CameraSource
     /// Checks only: each composed canvas before it is encoded, on the queue. Set before `goLive`.
     var onCanvas: ((CVPixelBuffer) -> Void)?
     /// Checks only: each mixed sound block (interleaved stereo, host time of its start) before it is encoded, on the queue.
@@ -103,6 +105,9 @@ final class Broadcaster: ObservableObject {
     private var ending = false
     /// Tells a microphone's reports from this stream apart from those of an earlier one.
     private var micSession = 0
+    /// Tells a camera's reports from this stream apart from those of an earlier one.
+    private var cameraSession = 0
+    private var cameraStarted = false
     /// Completions of `end` calls made while an end was already running.
     private var endCompletions: [() -> Void] = []
 
@@ -115,6 +120,8 @@ final class Broadcaster: ObservableObject {
     private var running = false
     private var session = 0
     private var config: StreamConfig?
+    /// nil = no corner picture: the camera is off for this stream, or was lost.
+    private var cameraLayout: CameraLayout?
     private var timer: DispatchSourceTimer?
     private var pictureDeadline = 0.0
     private var lastFrame: CVPixelBuffer?
@@ -131,6 +138,7 @@ final class Broadcaster: ObservableObject {
     private var audioEncoder: StreamAudioEncoder?
 
     init(device: MTLDevice, library: MTLLibrary) {
+        cameraSource = camera
         compositor = try? StreamCompositor(device: device, library: library)
     }
 
@@ -156,6 +164,16 @@ final class Broadcaster: ObservableObject {
         let timeScale = self.timeScale
         queue.async { self.start(config, timeScale: timeScale) }
         startMic(config.mic)
+        startCamera(config.camera)
+    }
+
+    /// Corner and size apply on the next frame, also while live.
+    func setCameraLayout(_ layout: CameraLayout) {
+        queue.async {
+            // Only while the stream has a camera that hasn't been lost.
+            guard self.cameraLayout != nil else { return }
+            self.cameraLayout = layout
+        }
     }
 
     /// Muting is for a live stream: it starts unmuted and does nothing otherwise.
@@ -252,6 +270,7 @@ final class Broadcaster: ObservableObject {
         onWantsFrames?(false)
         onWantsAudio?(false)
         stopMic()
+        stopCamera()
     }
 
     private func startMic(_ mic: (deviceID: String?, volume: Float, removeGameSound: Bool)?) {
@@ -293,6 +312,41 @@ final class Broadcaster: ObservableObject {
         queue.async { self.mixer?.remove(.mic) }
     }
 
+    private func startCamera(_ camera: (deviceID: String?, layout: CameraLayout)?) {
+        cameraSession += 1
+        guard let camera else { return }
+        cameraStarted = true
+        let session = cameraSession
+        cameraSource.onState = { [weak self] state in
+            DispatchQueue.main.async { self?.cameraChanged(state, session: session) }
+        }
+        cameraSource.start(deviceID: camera.deviceID, for: .stream)
+    }
+
+    /// Lets go of the stream's hold only: the Settings preview may still be using the camera.
+    private func stopCamera() {
+        cameraSession += 1
+        cameraSource.onState = nil
+        guard cameraStarted else { return }
+        cameraStarted = false
+        cameraSource.stop(for: .stream)
+    }
+
+    /// The stream goes on without the corner picture when the camera goes away or isn't allowed.
+    private func cameraChanged(_ state: CameraFeed.State, session: Int) {
+        guard session == cameraSession else { return }
+        switch state {
+        case .unavailable:
+            notice = "Camera disconnected"
+        case .denied:
+            notice = "Clarion isn't allowed to use the camera"
+        default:
+            return
+        }
+        // A last picture from a device on its way out must not stay on screen.
+        queue.async { self.cameraLayout = nil }
+    }
+
     private func publish(_ state: SiteState, for site: StreamSite) {
         DispatchQueue.main.async {
             self.states[site] = state
@@ -305,6 +359,7 @@ final class Broadcaster: ObservableObject {
     private func start(_ config: StreamConfig, timeScale: Double) {
         session += 1
         self.config = config
+        cameraLayout = config.camera?.layout
         timeScaleInUse = timeScale
         running = true
         let now = CACurrentMediaTime()
@@ -342,6 +397,7 @@ final class Broadcaster: ObservableObject {
         sites = [:]
         notes = [:]
         config = nil
+        cameraLayout = nil
         lastFrame = nil
         mixer = nil
         audioEncoder = nil
@@ -396,7 +452,7 @@ final class Broadcaster: ObservableObject {
         let session = self.session
         // Only canvases some publishing site is waiting for.
         let canvases = Set(encoders.filter { $0.value.wantsFrames }.map(\.key.quality))
-        let camera = config.camera.flatMap { camera in cameraFrame?().map { ($0, camera.layout) } }
+        let camera = cameraLayout.flatMap { layout in cameraSource.newestFrame().map { ($0, layout) } }
         for quality in canvases where !composing.contains(quality) {
             composing.insert(quality)
             compositor.compose(game: frame, camera: camera?.0, layout: camera?.1, canvas: quality.size) { [weak self] canvas in

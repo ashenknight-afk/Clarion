@@ -184,6 +184,90 @@ private final class FakeMic: MicSource {
     }
 }
 
+/// Stands in for `CameraFeed`: serves whatever frame it is given and records who started and stopped it.
+private final class FakeCamera: CameraSource {
+    let frame = Locked<CVPixelBuffer?>(nil)
+    var onState: ((CameraFeed.State) -> Void)?
+    private let started = Locked<[(deviceID: String?, user: CameraUser)]>([])
+    private let stopped = Locked<[CameraUser]>([])
+    var startCalls: [(deviceID: String?, user: CameraUser)] { started.value }
+    var stopCalls: [CameraUser] { stopped.value }
+
+    func newestFrame() -> CVPixelBuffer? { frame.value }
+
+    func start(deviceID: String?, for user: CameraUser) {
+        started.update { $0.append((deviceID, user)) }
+        onState?(.running("Stand-in"))
+    }
+
+    func stop(for user: CameraUser) { stopped.update { $0.append(user) } }
+
+    /// The camera reports that it is gone, and has no picture any more.
+    func disconnect() {
+        frame.update { $0 = nil }
+        onState?(.unavailable("Stand-in"))
+    }
+}
+
+private func solidFrame(width: Int, height: Int, blue: UInt8, green: UInt8, red: UInt8) -> CVPixelBuffer? {
+    let attributes: [CFString: Any] = [kCVPixelBufferIOSurfacePropertiesKey: [CFString: Any](),
+                                       kCVPixelBufferMetalCompatibilityKey: true]
+    var buffer: CVPixelBuffer?
+    guard CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, attributes as CFDictionary, &buffer) == kCVReturnSuccess,
+          let buffer else { return nil }
+    CVPixelBufferLockBaseAddress(buffer, [])
+    defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+    guard let base = CVPixelBufferGetBaseAddress(buffer)?.assumingMemoryBound(to: UInt8.self) else { return nil }
+    let stride = CVPixelBufferGetBytesPerRow(buffer)
+    for y in 0..<height {
+        for x in 0..<width {
+            let p = base + y * stride + x * 4
+            p[0] = blue; p[1] = green; p[2] = red; p[3] = 255
+        }
+    }
+    return buffer
+}
+
+private struct Rgb { let blue: UInt8, green: UInt8, red: UInt8 }
+
+private func rgb(_ buffer: CVPixelBuffer, at point: CGPoint) -> Rgb {
+    CVPixelBufferLockBaseAddress(buffer, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+    let p = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)
+        + Int(point.y) * CVPixelBufferGetBytesPerRow(buffer) + Int(point.x) * 4
+    return Rgb(blue: p[0], green: p[1], red: p[2])
+}
+
+private func isGreen(_ c: Rgb?) -> Bool { c.map { $0.green > 200 && $0.red < 40 && $0.blue < 40 } ?? false }
+/// The game's grey (90) showing through.
+private func isGameGrey(_ c: Rgb?) -> Bool { c.map { abs(Int($0.green) - 90) < 12 && abs(Int($0.red) - 90) < 12 && abs(Int($0.blue) - 90) < 12 } ?? false }
+
+private let canvasSize = CGSize(width: 1920, height: 1080)
+
+private func centre(of corner: StreamCorner, size: StreamCameraSize = .medium) -> CGPoint {
+    let rect = StreamCompositor.cameraRect(canvas: canvasSize, aspect: 16.0 / 9.0, layout: CameraLayout(corner: corner, size: size))
+    return CGPoint(x: rect.midX, y: rect.midY)
+}
+
+private func cameraConfig(port: UInt16, corner: StreamCorner = .bottomRight, size: StreamCameraSize = .medium) -> StreamConfig {
+    var config = oneSite(port: port, key: "abc")
+    config.camera = (deviceID: "usb-cam", layout: CameraLayout(corner: corner, size: size))
+    return config
+}
+
+/// What the composed canvas shows at two corners' centres, as of its latest frame.
+private final class CornerProbe {
+    private let latest = Locked<(bottomRight: Rgb, topLeft: Rgb)?>(nil)
+    init(_ broadcaster: Broadcaster) {
+        let bottomRight = centre(of: .bottomRight), topLeft = centre(of: .topLeft)
+        broadcaster.onCanvas = { [latest] canvas in
+            latest.update { $0 = (rgb(canvas, at: bottomRight), rgb(canvas, at: topLeft)) }
+        }
+    }
+    var bottomRight: Rgb? { latest.value?.bottomRight }
+    var topLeft: Rgb? { latest.value?.topLeft }
+}
+
 /// How strongly a tone at `frequency` is in the left channel of interleaved 48 kHz stereo blocks, as an amplitude.
 private func toneLevel(_ blocks: [[Float]], frequency: Double) -> Double {
     let left = blocks.flatMap { block in stride(from: 0, to: block.count, by: 2).map { Double(block[$0]) } }
@@ -701,5 +785,122 @@ func broadcasterChecks() {
         try expect(mic.startCalls.isEmpty, "microphone started")
         try expect(broadcaster.micState == .off, "state \(broadcaster.micState)")
         try ends(broadcaster)
+    }
+
+    check("the camera shows in its corner, and only when the stream asks for it") {
+        let server = try RTMPTestServer(behaviour: .accept)
+        defer { server.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        let camera = FakeCamera()
+        camera.frame.update { $0 = solidFrame(width: 1280, height: 720, blue: 0, green: 255, red: 0) }
+        broadcaster.cameraSource = camera
+        let probe = CornerProbe(broadcaster)
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(cameraConfig(port: server.port))
+        try expect(spin(timeout: 5) { isGreen(probe.bottomRight) }, "corner never green")
+        try expect(isGameGrey(probe.topLeft), "the other corner changed")
+        try expect(camera.startCalls.count == 1 && camera.startCalls[0].deviceID == "usb-cam" && camera.startCalls[0].user == .stream,
+                   "start calls \(camera.startCalls)")
+        try ends(broadcaster)
+        try expect(camera.stopCalls == [.stream], "stop calls \(camera.stopCalls)")
+
+        // Camera off: the source has a picture, but the stream never asks for it.
+        let off = Broadcaster(device: device, library: library)
+        let idle = FakeCamera()
+        idle.frame.update { $0 = solidFrame(width: 1280, height: 720, blue: 0, green: 255, red: 0) }
+        off.cameraSource = idle
+        let offProbe = CornerProbe(off)
+        guard let offFeeder = Feeder(broadcaster: off) else { throw CheckFailure(description: "no frames") }
+        offFeeder.start()
+        defer { offFeeder.stop() }
+        off.goLive(oneSite(port: server.port, key: "abc"))
+        try expect(spin(timeout: 5) { off.states[.twitch] == .live }, "not live")
+        try expect(spin(timeout: 5) { offProbe.bottomRight != nil }, "no canvas")
+        spin(timeout: 0.5)
+        try expect(isGameGrey(offProbe.bottomRight), "camera shown with the camera off")
+        try expect(idle.startCalls.isEmpty, "camera started by itself: \(idle.startCalls)")
+        try ends(off)
+        try expect(idle.stopCalls.isEmpty, "camera stopped though never started: \(idle.stopCalls)")
+    }
+
+    check("changing the corner mid-stream moves the camera on the next frame") {
+        let server = try RTMPTestServer(behaviour: .accept)
+        defer { server.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        let camera = FakeCamera()
+        camera.frame.update { $0 = solidFrame(width: 1280, height: 720, blue: 0, green: 255, red: 0) }
+        broadcaster.cameraSource = camera
+        let probe = CornerProbe(broadcaster)
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(cameraConfig(port: server.port))
+        try expect(spin(timeout: 5) { isGreen(probe.bottomRight) }, "corner never green")
+        broadcaster.setCameraLayout(CameraLayout(corner: .topLeft, size: .medium))
+        try expect(spin(timeout: 2) { isGreen(probe.topLeft) && isGameGrey(probe.bottomRight) },
+                   "top left \(String(describing: probe.topLeft)), bottom right \(String(describing: probe.bottomRight))")
+        try expect(broadcaster.states[.twitch] == .live, "no longer live")
+        try ends(broadcaster)
+    }
+
+    check("a camera that returns no picture leaves the stream live with the game in the corner") {
+        let server = try RTMPTestServer(behaviour: .accept)
+        defer { server.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        let camera = FakeCamera()
+        camera.frame.update { $0 = solidFrame(width: 1280, height: 720, blue: 0, green: 255, red: 0) }
+        broadcaster.cameraSource = camera
+        let probe = CornerProbe(broadcaster)
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(cameraConfig(port: server.port))
+        try expect(spin(timeout: 5) { isGreen(probe.bottomRight) }, "corner never green")
+        camera.frame.update { $0 = nil }
+        try expect(spin(timeout: 2) { isGameGrey(probe.bottomRight) }, "corner \(String(describing: probe.bottomRight))")
+        try expect(broadcaster.states[.twitch] == .live && broadcaster.isLive, "no longer live")
+        try expect(broadcaster.notice == nil, "notice \(broadcaster.notice ?? "nil")")
+        // It comes back by itself.
+        camera.frame.update { $0 = solidFrame(width: 1280, height: 720, blue: 0, green: 255, red: 0) }
+        try expect(spin(timeout: 2) { isGreen(probe.bottomRight) }, "corner didn't come back")
+        try ends(broadcaster)
+    }
+
+    check("a camera that is lost or denied leaves the stream live with a notice") {
+        for (state, text) in [(CameraFeed.State.unavailable("Stand-in"), "Camera disconnected"),
+                              (CameraFeed.State.denied, "Clarion isn't allowed to use the camera")] {
+            let server = try RTMPTestServer(behaviour: .accept)
+            defer { server.stop() }
+            let broadcaster = Broadcaster(device: device, library: library)
+            let camera = FakeCamera()
+            camera.frame.update { $0 = solidFrame(width: 1280, height: 720, blue: 0, green: 255, red: 0) }
+            broadcaster.cameraSource = camera
+            let probe = CornerProbe(broadcaster)
+            guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+            feeder.start()
+            defer { feeder.stop() }
+            broadcaster.goLive(cameraConfig(port: server.port))
+            try expect(spin(timeout: 5) { isGreen(probe.bottomRight) }, "corner never green")
+            // A device on its way out can still hand over a last picture: the corner must go anyway.
+            camera.onState?(state)
+            try expect(spin(timeout: 2) { broadcaster.notice == text }, "notice \(broadcaster.notice ?? "nil") for \(state)")
+            try expect(spin(timeout: 2) { isGameGrey(probe.bottomRight) }, "corner \(String(describing: probe.bottomRight)) for \(state)")
+            try expect(broadcaster.states[.twitch] == .live && broadcaster.isLive, "no longer live for \(state)")
+            try ends(broadcaster)
+        }
+    }
+
+    check("the preview and the stream each keep the camera running until both let go") {
+        var holds = CameraHolds()
+        try expect(holds.add(.preview), "first user should start the camera")
+        try expect(!holds.add(.stream), "second user shouldn't restart it")
+        try expect(!holds.remove(.preview), "the camera stopped under the stream")
+        try expect(holds.remove(.stream), "the last user leaving should stop it")
+        try expect(holds.add(.stream), "stream alone should start it")
+        try expect(!holds.remove(.preview), "preview never held it")
+        try expect(holds.remove(.stream), "stream should stop it")
+        try expect(!holds.remove(.stream), "nothing left to stop")
     }
 }

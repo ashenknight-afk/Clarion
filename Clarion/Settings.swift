@@ -68,6 +68,10 @@ final class AppSettings: ObservableObject {
         static let micDeviceID = "stream.mic.deviceID"
         static let micVolume = "stream.mic.volume"
         static let micRemoveGameSound = "stream.mic.removeGameSound"
+        static let cameraEnabled = "stream.camera.enabled"
+        static let cameraDeviceID = "stream.camera.deviceID"
+        static let cameraCorner = "stream.camera.corner"
+        static let cameraSize = "stream.camera.size"
     }
 
     private let defaults: UserDefaults
@@ -134,6 +138,13 @@ final class AppSettings: ObservableObject {
     @Published var micVolume: Double { didSet { defaults.set(micVolume, forKey: Key.micVolume) } }
     /// Voice processing cancels the game's sound out of the microphone, for when it plays from speakers.
     @Published var micRemoveGameSound: Bool { didSet { defaults.set(micRemoveGameSound, forKey: Key.micRemoveGameSound) } }
+    /// Off until the owner turns it on; going live never does.
+    @Published var cameraEnabled: Bool { didSet { defaults.set(cameraEnabled, forKey: Key.cameraEnabled) } }
+    /// nil = the first built-in or Continuity camera.
+    @Published var cameraDeviceID: String? { didSet { defaults.set(cameraDeviceID, forKey: Key.cameraDeviceID) } }
+    @Published var cameraCorner: StreamCorner { didSet { defaults.set(cameraCorner.rawValue, forKey: Key.cameraCorner) } }
+    @Published var cameraSize: StreamCameraSize { didSet { defaults.set(cameraSize.rawValue, forKey: Key.cameraSize) } }
+    var cameraLayout: CameraLayout { CameraLayout(corner: cameraCorner, size: cameraSize) }
     /// A measuring aid, so it always starts off.
     @Published var latencyTest = false
 
@@ -191,6 +202,10 @@ final class AppSettings: ObservableObject {
         micDeviceID = defaults.string(forKey: Key.micDeviceID)
         micVolume = defaults.object(forKey: Key.micVolume) as? Double ?? 1
         micRemoveGameSound = defaults.object(forKey: Key.micRemoveGameSound) as? Bool ?? true
+        cameraEnabled = defaults.bool(forKey: Key.cameraEnabled)
+        cameraDeviceID = defaults.string(forKey: Key.cameraDeviceID)
+        cameraCorner = defaults.string(forKey: Key.cameraCorner).flatMap(StreamCorner.init(rawValue:)) ?? .bottomRight
+        cameraSize = defaults.string(forKey: Key.cameraSize).flatMap(StreamCameraSize.init(rawValue:)) ?? .medium
     }
 
     /// Reads the stream keys from the keychain: call it only when going live.
@@ -202,7 +217,8 @@ final class AppSettings: ObservableObject {
                                     quality: site == .youtube ? streamYouTubeQuality : .p1080,
                                     bitrate: streamBitrate[site] ?? 0)
         }
-        return StreamConfig(sites: sites, gameVolume: Float(streamGameVolume), camera: nil,
+        return StreamConfig(sites: sites, gameVolume: Float(streamGameVolume),
+                            camera: cameraEnabled ? (cameraDeviceID, cameraLayout) : nil,
                             mic: micEnabled ? (micDeviceID, Float(micVolume), micRemoveGameSound) : nil)
     }
 }

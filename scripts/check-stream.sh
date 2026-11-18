@@ -12,6 +12,8 @@ SOURCES=(
   Clarion/StreamVideoEncoder.swift
   Clarion/StreamAudio.swift
   Clarion/MicInput.swift
+  Clarion/CameraFeed.swift
+  Clarion/CaptureManager.swift
   Clarion/StreamCompositor.swift
   Clarion/Recorder.swift
   Clarion/StreamKeychain.swift

@@ -80,6 +80,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let broadcaster = Broadcaster(device: device, library: library)
         self.broadcaster = broadcaster
+        // The card is never offered as a webcam.
+        capture.$activeDevice
+            .receive(on: DispatchQueue.main)
+            .sink { broadcaster.camera.excludedDeviceID = $0?.id }
+            .store(in: &cancellables)
 
         let overlay = VideoOverlayRoot(settings: settings, ui: ui, stats: stats, recorder: recorder, broadcaster: broadcaster,
                                        capture: capture,

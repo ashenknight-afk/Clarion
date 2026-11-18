@@ -53,7 +53,7 @@ struct SettingsView: View {
                     audioSection
                 }
                 recordingSection
-                StreamSettingsSection(settings: settings, broadcaster: broadcaster)
+                StreamSettingsSection(settings: settings, broadcaster: broadcaster, camera: broadcaster.camera)
                 Section("Overlay & testing") {
                     Toggle("Show stats overlay", isOn: $settings.showOverlay)
                     VStack(alignment: .leading, spacing: 4) {

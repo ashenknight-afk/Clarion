@@ -6,6 +6,8 @@ import SwiftUI
 struct StreamSettingsSection: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject var broadcaster: Broadcaster
+    /// The broadcaster's own camera, observed here so the preview's state redraws.
+    @ObservedObject var camera: CameraFeed
 
     /// The section's own state. A class rather than `@State`: `@State` is a macro in the newer SDKs,
     /// which the command-line type-check can't expand.
@@ -38,8 +40,14 @@ struct StreamSettingsSection: View {
             model.micDevices = AVCaptureDevice.DiscoverySession(deviceTypes: [.microphone, .external], mediaType: .audio,
                                                                 position: .unspecified).devices
                 .map { CaptureDeviceInfo(id: $0.uniqueID, name: $0.localizedName, modelID: $0.modelID) }
+            camera.refreshDevices()
             model.savedKeys = Dictionary(uniqueKeysWithValues: StreamSite.allCases.map { ($0, StreamKeychain.hasKey(for: $0)) })
         }
+        .onAppear { updatePreview() }
+        .onDisappear { camera.stop(for: .preview) }
+        .onChange(of: settings.cameraEnabled) { _, _ in updatePreview() }
+        .onChange(of: settings.cameraDeviceID) { _, _ in updatePreview() }
+        .onChange(of: settings.cameraLayout) { _, layout in broadcaster.setCameraLayout(layout) }
         .onChange(of: focusedKey) { previous, _ in
             if let previous { saveKey(previous) }
         }
@@ -102,6 +110,8 @@ struct StreamSettingsSection: View {
             }
         }
 
+        cameraControls
+
         LabeledContent("Game volume in stream") {
             HStack {
                 Slider(value: $settings.streamGameVolume, in: 0...1)
@@ -154,6 +164,64 @@ struct StreamSettingsSection: View {
                 .foregroundStyle(.secondary)
         }
         .disabled(broadcaster.isLive)
+    }
+
+    @ViewBuilder private var cameraControls: some View {
+        Toggle("Camera", isOn: $settings.cameraEnabled)
+            .disabled(broadcaster.isLive)
+        if settings.cameraEnabled {
+            Picker("Camera device", selection: $settings.cameraDeviceID) {
+                Text("Automatic").tag(String?.none)
+                if let saved = settings.cameraDeviceID, !camera.devices.contains(where: { $0.id == saved }) {
+                    Text("Saved camera (unplugged)").tag(Optional(saved))
+                }
+                ForEach(camera.devices) { device in
+                    Text(device.name).tag(Optional(device.id))
+                }
+            }
+            .disabled(broadcaster.isLive)
+            Picker("Corner", selection: $settings.cameraCorner) {
+                Text("Top left").tag(StreamCorner.topLeft)
+                Text("Top right").tag(StreamCorner.topRight)
+                Text("Bottom left").tag(StreamCorner.bottomLeft)
+                Text("Bottom right").tag(StreamCorner.bottomRight)
+            }
+            Picker("Camera size", selection: $settings.cameraSize) {
+                Text("Small").tag(StreamCameraSize.small)
+                Text("Medium").tag(StreamCameraSize.medium)
+                Text("Large").tag(StreamCameraSize.large)
+            }
+            CameraPreview(camera: camera)
+                .frame(width: 160, height: 90)
+            if let line = cameraLine { Text(line).font(.callout).foregroundStyle(cameraNeedsAttention ? .yellow : .secondary) }
+        }
+    }
+
+    /// The preview runs only while this section is open and the camera is on. The stream holds the camera
+    /// separately, so closing Settings never stops a camera that is live.
+    private func updatePreview() {
+        if settings.cameraEnabled {
+            camera.start(deviceID: settings.cameraDeviceID, for: .preview)
+        } else {
+            camera.stop(for: .preview)
+        }
+    }
+
+    private var cameraLine: String? {
+        switch camera.state {
+        case .off: return nil
+        case .needsPermission: return "Camera: waiting for permission"
+        case .denied: return "Camera: not allowed. Turn it on in System Settings > Privacy & Security > Camera."
+        case .running(let name): return "Camera: \(name)"
+        case .unavailable(let name): return "Camera: \(name) disconnected"
+        }
+    }
+
+    private var cameraNeedsAttention: Bool {
+        switch camera.state {
+        case .denied, .unavailable: return true
+        case .off, .needsPermission, .running: return false
+        }
     }
 
     private var micLine: String? {
@@ -226,4 +294,31 @@ struct StreamSettingsSection: View {
         Binding(get: { (settings.streamBitrate[site] ?? 0) > 0 ? settings.streamBitrate[site]! / 1000 : nil },
                 set: { settings.streamBitrate[site] = max(0, ($0 ?? 0) * 1000) })
     }
+}
+
+/// The camera's own layer at 160×90. The only place the camera shows on this Mac's screen.
+private struct CameraPreview: NSViewRepresentable {
+    let camera: CameraFeed
+
+    final class HostView: NSView {
+        let preview: AVCaptureVideoPreviewLayer
+        init(_ layer: AVCaptureVideoPreviewLayer) {
+            preview = layer
+            super.init(frame: .zero)
+            wantsLayer = true
+            self.layer?.cornerRadius = 6
+            self.layer?.masksToBounds = true
+            self.layer?.backgroundColor = NSColor.black.cgColor
+            self.layer?.addSublayer(layer)
+        }
+        required init?(coder: NSCoder) { nil }
+        override func layout() {
+            super.layout()
+            preview.frame = bounds
+        }
+    }
+
+    func makeNSView(context: Context) -> HostView { HostView(camera.previewLayer) }
+    func updateNSView(_ view: HostView, context: Context) {}
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: HostView, context: Context) -> CGSize? { CGSize(width: 160, height: 90) }
 }
