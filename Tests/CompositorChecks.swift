@@ -111,20 +111,87 @@ func compositorChecks() {
         // The rounded corner leaves the game showing at the rect's very corner.
         try expect(isColor(pixel(out, Int(rect.minX) + 1, Int(rect.minY) + 1), red), "corner \(pixel(out, Int(rect.minX) + 1, Int(rect.minY) + 1))")
     }
-    check("camera is cropped, not stretched") {
-        // 4:3 camera, left and right thirds blue, middle green: the 16:9 crop keeps rows, so only the centre shows.
-        let camera = makeBuffer(800, 600) { x, _ in x < 100 || x >= 700 ? blue : green }
+    check("4:3 camera is cropped vertically, not stretched") {
+        // Top and bottom eighths blue, middle green: a 16:9 crop of a 4:3 picture cuts 12.5% off top and
+        // bottom, so the rect shows green to its very edge. A stretched picture would show blue there.
+        let camera = makeBuffer(800, 600) { _, y in y < 75 || y >= 525 ? blue : green }
         let layout = CameraLayout(corner: .topLeft, size: .large)
         let out = try compose(compositor, game: makeBuffer(1920, 1080) { _, _ in red }, camera: camera, layout: layout)
         let rect = StreamCompositor.cameraRect(canvas: CGSize(width: 1920, height: 1080), aspect: 16.0 / 9.0, layout: layout)
-        try expect(isColor(pixel(out, Int(rect.minX) + 20, Int(rect.midY)), blue), "left edge keeps the full width")
-        try expect(isColor(pixel(out, Int(rect.midX), Int(rect.midY)), green), "centre")
+        let top = pixel(out, Int(rect.midX), Int(rect.minY) + 2)
+        let bottom = pixel(out, Int(rect.midX), Int(rect.maxY) - 3)
+        try expect(isColor(top, green), "top row \(top)")
+        try expect(isColor(bottom, green), "bottom row \(bottom)")
+    }
+    check("21:9 camera is cropped horizontally, not stretched") {
+        // Side bands blue, centre green: the 16:9 crop of a 21:9 picture drops about 12% each side.
+        let camera = makeBuffer(2100, 900) { x, _ in x < 200 || x >= 1900 ? blue : green }
+        let layout = CameraLayout(corner: .topLeft, size: .large)
+        let out = try compose(compositor, game: makeBuffer(1920, 1080) { _, _ in red }, camera: camera, layout: layout)
+        let rect = StreamCompositor.cameraRect(canvas: CGSize(width: 1920, height: 1080), aspect: 16.0 / 9.0, layout: layout)
+        let left = pixel(out, Int(rect.minX) + 4, Int(rect.midY))
+        let right = pixel(out, Int(rect.maxX) - 5, Int(rect.midY))
+        try expect(isColor(left, green), "left edge \(left)")
+        try expect(isColor(right, green), "right edge \(right)")
+    }
+    check("no camera without a camera or a layout") {
+        let layout = CameraLayout(corner: .bottomRight, size: .medium)
+        let rect = StreamCompositor.cameraRect(canvas: CGSize(width: 1920, height: 1080), aspect: 16.0 / 9.0, layout: layout)
+        let game = makeBuffer(1920, 1080) { _, _ in red }
+        let noCamera = try compose(compositor, game: game, camera: nil, layout: layout)
+        try expect(isColor(pixel(noCamera, Int(rect.midX), Int(rect.midY)), red), "nil camera")
+        let noLayout = try compose(compositor, game: game, camera: makeBuffer(1280, 720) { _, _ in green }, layout: nil)
+        try expect(isColor(pixel(noLayout, Int(rect.midX), Int(rect.midY)), red), "nil layout")
+    }
+    check("camera corner keeps the canvas opaque") {
+        let layout = CameraLayout(corner: .bottomRight, size: .medium)
+        let out = try compose(compositor, game: makeBuffer(1920, 1080) { _, _ in red },
+                              camera: makeBuffer(1280, 720) { _, _ in green }, layout: layout)
+        let rect = StreamCompositor.cameraRect(canvas: CGSize(width: 1920, height: 1080), aspect: 16.0 / 9.0, layout: layout)
+        // Radius is 15.36 px: this pixel sits on the curve (coverage about a third), so it is blended.
+        let x = Int(rect.minX) + 5, y = Int(rect.minY) + 4
+        CVPixelBufferLockBaseAddress(out, .readOnly)
+        let p = CVPixelBufferGetBaseAddress(out)!.assumingMemoryBound(to: UInt8.self) + y * CVPixelBufferGetBytesPerRow(out) + x * 4
+        let alpha = p[3], blendedGreen = p[1]
+        CVPixelBufferUnlockBaseAddress(out, .readOnly)
+        try expect(blendedGreen > 3 && blendedGreen < 252, "pixel was not blended: green \(blendedGreen)")
+        try expect(alpha == 255, "alpha \(alpha)")
     }
     check("game size changes between calls") {
         let first = try compose(compositor, game: makeBuffer(3024, 1700) { _, _ in red })
-        let second = try compose(compositor, game: makeBuffer(2560, 1440) { _, _ in red })
+        let second = try compose(compositor, game: makeBuffer(2560, 1440) { _, _ in blue })
         try expect(CVPixelBufferGetWidth(first) == 1920 && CVPixelBufferGetHeight(first) == 1080, "first")
         try expect(CVPixelBufferGetWidth(second) == 1920 && CVPixelBufferGetHeight(second) == 1080, "second")
+        try expect(isColor(pixel(first, 960, 540), red), "first colour \(pixel(first, 960, 540))")
+        try expect(isColor(pixel(second, 960, 540), blue), "second colour \(pixel(second, 960, 540))")
+    }
+    check("compose is re-entrant") {
+        let colors: [Color] = [red, green, blue, (255, 255, 255), (0, 255, 255), (255, 0, 255), (255, 255, 0), (128, 128, 128)]
+        let done = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var outputs = [Int: CVPixelBuffer]()
+        for (i, color) in colors.enumerated() {
+            compositor.compose(game: makeBuffer(1280, 720) { _, _ in color }, camera: nil, layout: nil, canvas: (1920, 1080)) {
+                lock.lock(); outputs[i] = $0; lock.unlock()
+                done.signal()
+            }
+        }
+        for _ in colors { try expect(done.wait(timeout: .now() + 5) == .success, "timed out") }
+        try expect(outputs.count == colors.count, "completions \(outputs.count)")
+        for (i, color) in colors.enumerated() {
+            guard let out = outputs[i] else { throw CheckFailure(description: "output \(i) nil") }
+            try expect(isColor(pixel(out, 960, 540), color), "output \(i) \(pixel(out, 960, 540))")
+        }
+        let distinct = Set(outputs.values.map { ObjectIdentifier($0) })
+        try expect(distinct.count == colors.count, "buffers reused: \(distinct.count) distinct")
+    }
+    check("failure completes off the caller's stack") {
+        let done = DispatchSemaphore(value: 0)
+        var returned = false, early = false
+        compositor.compose(game: nil, camera: nil, layout: nil, canvas: (0, 0)) { _ in early = !returned; done.signal() }
+        returned = true
+        try expect(done.wait(timeout: .now() + 5) == .success, "timed out")
+        try expect(!early, "completion ran before compose returned")
     }
     check("no game gives a black canvas") {
         let out = try compose(compositor, game: nil)

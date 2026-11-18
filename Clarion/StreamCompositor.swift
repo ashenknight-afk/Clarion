@@ -95,8 +95,9 @@ final class StreamCompositor {
         attachment.isBlendingEnabled = true
         attachment.sourceRGBBlendFactor = .sourceAlpha
         attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
-        attachment.sourceAlphaBlendFactor = .sourceAlpha
-        attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        // The canvas stays opaque: the camera's antialiased edge must not leave it translucent.
+        attachment.sourceAlphaBlendFactor = .zero
+        attachment.destinationAlphaBlendFactor = .one
         var cache: CVMetalTextureCache?
         guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess,
               let cache else { throw CompositorError.setupFailed("texture cache") }
@@ -106,20 +107,22 @@ final class StreamCompositor {
         textureCache = cache
     }
 
-    /// Draws on its own command queue; `completion` runs on a Metal thread. Black canvas when `game` is nil.
+    /// Draws on its own command queue; `completion` runs on a Metal thread, or on a global queue when
+    /// it fails before any GPU work, so never before this returns. Black canvas when `game` is nil.
     func compose(game: CVPixelBuffer?, camera: CVPixelBuffer?, layout: CameraLayout?,
                  canvas: (width: Int, height: Int), completion: @escaping (CVPixelBuffer?) -> Void) {
+        func fail() { DispatchQueue.global().async { completion(nil) } }
         guard canvas.width > 0, canvas.height > 0,
               let output = outputBuffer(width: canvas.width, height: canvas.height),
               let (outputTexture, outputRef) = texture(output),
-              let commands = queue.makeCommandBuffer() else { return completion(nil) }
+              let commands = queue.makeCommandBuffer() else { return fail() }
 
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = outputTexture
         pass.colorAttachments[0].loadAction = .clear
         pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         pass.colorAttachments[0].storeAction = .store
-        guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return completion(nil) }
+        guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return fail() }
         encoder.setRenderPipelineState(pipeline)
 
         let canvasSize = CGSize(width: canvas.width, height: canvas.height)
@@ -160,7 +163,9 @@ final class StreamCompositor {
             draw(camera, rect: rect, crop: crop, radius: Float(rect.width * 0.04))
         }
         encoder.endEncoding()
-        if failed { return completion(nil) }
+        // Textures still in use are retained by `held`; this only drops unused cache entries.
+        CVMetalTextureCacheFlush(textureCache, 0)
+        if failed { return fail() }
 
         commands.addCompletedHandler { buffer in
             withExtendedLifetime(held) {}
