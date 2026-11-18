@@ -4,7 +4,17 @@ import Network
 /// A loopback RTMP server for the checks: does the server side of the handshake, answers
 /// `connect` and `createStream`, then answers `publish` according to its behaviour.
 final class RTMPTestServer {
-    enum Behaviour { case accept, rejectPublish(description: String), dropAfterPublish }
+    enum Behaviour {
+        case accept, rejectPublish(description: String), dropAfterPublish
+        /// The first connection is dropped after publishing, later ones are accepted.
+        case dropOnceThenAccept
+        /// Accepts the TCP connection and never answers.
+        case silent
+        /// Answers `connect` with a `_result` that doesn't decode.
+        case garbleConnectAnswer
+        /// Accepts the publish, then stops reading, like a dead network.
+        case stallAfterPublish
+    }
 
     struct StartError: Error, CustomStringConvertible { let description: String }
 
@@ -15,25 +25,47 @@ final class RTMPTestServer {
         var stage = 0 // 0: waiting for C0+C1, 1: waiting for C2, 2: chunks
         var reader = RTMPChunkReader()
         let writer = RTMPChunkWriter()
-        init(_ connection: NWConnection) { self.connection = connection }
+        let index: Int
+        var stalled = false
+        init(_ connection: NWConnection, index: Int) {
+            self.connection = connection
+            self.index = index
+        }
     }
 
     private static let handshakeSize = 1536
 
     private let behaviour: Behaviour
+    private let stopsListeningOnDrop: Bool
+    private let ackWindow: UInt32?
+    private let pingAfterPublish: Bool
+    private let createStreamDelay: TimeInterval
     private let queue = DispatchQueue(label: "RTMPTestServer")
     private let listener: NWListener
     private var peers: [Peer] = []
     private var receivedMessages: [RTMPMessage] = []
+    private var perConnection: [[RTMPMessage]] = []
     private var key: String?
 
     var port: UInt16 { listener.port?.rawValue ?? 0 }
     /// Every message clients sent, in order, once the handshake was done.
     var received: [RTMPMessage] { queue.sync { receivedMessages } }
+    /// The same, per client connection in the order they connected.
+    var receivedPerConnection: [[RTMPMessage]] { queue.sync { perConnection } }
+    var connectionCount: Int { queue.sync { peers.count } }
     var publishedKey: String? { queue.sync { key } }
 
-    init(behaviour: Behaviour) throws {
+    /// `stopsListeningOnDrop`: a dropped publish also closes the listener, so reconnecting is refused.
+    /// `ackWindow`: sent as Window Acknowledgement Size before answering `connect`.
+    /// `pingAfterPublish`: a ping request (payload 0 6 1 2 3 4) follows the publish answer.
+    /// `createStreamDelay`: how long the `createStream` answer waits.
+    init(behaviour: Behaviour, stopsListeningOnDrop: Bool = false, ackWindow: UInt32? = nil, pingAfterPublish: Bool = false,
+         createStreamDelay: TimeInterval = 0) throws {
         self.behaviour = behaviour
+        self.stopsListeningOnDrop = stopsListeningOnDrop
+        self.ackWindow = ackWindow
+        self.pingAfterPublish = pingAfterPublish
+        self.createStreamDelay = createStreamDelay
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
         listener = try NWListener(using: parameters)
@@ -63,8 +95,9 @@ final class RTMPTestServer {
     }
 
     private func accept(_ connection: NWConnection) {
-        let peer = Peer(connection)
+        let peer = Peer(connection, index: peers.count)
         peers.append(peer)
+        perConnection.append([])
         connection.start(queue: queue)
         receive(peer)
     }
@@ -75,13 +108,14 @@ final class RTMPTestServer {
             if let data, !data.isEmpty { self.handle(data, from: peer) }
             if isComplete || error != nil {
                 peer.connection.cancel()
-            } else {
+            } else if !peer.stalled {
                 self.receive(peer)
             }
         }
     }
 
     private func handle(_ data: Data, from peer: Peer) {
+        if case .silent = behaviour { return }
         var bytes = [UInt8](data)
         if peer.stage < 2 {
             peer.handshake += bytes
@@ -109,6 +143,7 @@ final class RTMPTestServer {
         }
         for message in messages {
             receivedMessages.append(message)
+            perConnection[peer.index].append(message)
             if message.type == RTMPMessage.Kind.command.rawValue { answer(message, from: peer) }
         }
     }
@@ -118,22 +153,51 @@ final class RTMPTestServer {
         let transaction = values.count > 1 ? values[1] : .number(0)
         switch name {
         case "connect":
+            if let ackWindow {
+                let message = RTMPMessage(type: RTMPMessage.Kind.windowAckSize.rawValue, streamID: 0, timestamp: 0,
+                                          payload: Data(withUnsafeBytes(of: ackWindow.bigEndian, Array.init)))
+                peer.connection.send(content: peer.writer.chunks(for: message, chunkStreamID: 2), completion: .idempotent)
+            }
+            if case .garbleConnectAnswer = behaviour {
+                // "_result", transaction 1, then an object cut off in the middle of a key.
+                var payload = Data()
+                AMF0.string("_result").encode(into: &payload)
+                transaction.encode(into: &payload)
+                payload.append(contentsOf: [0x03, 0x00, 0x10, 0x61])
+                let message = RTMPMessage(type: RTMPMessage.Kind.command.rawValue, streamID: 0, timestamp: 0, payload: payload)
+                peer.connection.send(content: peer.writer.chunks(for: message, chunkStreamID: 3), completion: .idempotent)
+                return
+            }
             send([.string("_result"), transaction,
                   .object([.init(key: "fmsVer", value: .string("FMS/3,0,1,123"))]),
                   status("status", "NetConnection.Connect.Success", "Connection succeeded.")], to: peer)
         case "createStream":
-            send([.string("_result"), transaction, .null, .number(1)], to: peer)
+            queue.asyncAfter(deadline: .now() + createStreamDelay) { [weak self] in
+                self?.send([.string("_result"), transaction, .null, .number(1)], to: peer)
+            }
         case "publish":
             if values.count > 3, case .string(let published) = values[3] { key = published }
+            let drops: Bool
             switch behaviour {
-            case .accept:
-                send(onStatus("status", "NetStream.Publish.Start", "Publishing."), to: peer, streamID: 1)
             case .rejectPublish(let description):
                 send(onStatus("error", "NetStream.Publish.BadName", description), to: peer, streamID: 1)
-            case .dropAfterPublish:
-                send(onStatus("status", "NetStream.Publish.Start", "Publishing."), to: peer, streamID: 1) {
-                    peer.connection.cancel()
-                }
+                return
+            case .dropAfterPublish: drops = true
+            case .dropOnceThenAccept: drops = peer.index == 0
+            case .stallAfterPublish:
+                drops = false
+                peer.stalled = true
+            case .accept, .silent, .garbleConnectAnswer: drops = false
+            }
+            send(onStatus("status", "NetStream.Publish.Start", "Publishing."), to: peer, streamID: 1) { [weak self] in
+                guard drops else { return }
+                if self?.stopsListeningOnDrop == true { self?.listener.cancel() }
+                peer.connection.cancel()
+            }
+            if pingAfterPublish, !drops {
+                let ping = RTMPMessage(type: RTMPMessage.Kind.userControl.rawValue, streamID: 0, timestamp: 0,
+                                       payload: Data([0, 6, 1, 2, 3, 4]))
+                peer.connection.send(content: peer.writer.chunks(for: ping, chunkStreamID: 2), completion: .idempotent)
             }
         default:
             break

@@ -47,6 +47,8 @@ final class RTMPConnection {
     enum State: Equatable { case connecting, publishing, failed(String), closed }
 
     static let connectTimeout: TimeInterval = 10
+    /// A send the network hasn't taken for this long means the connection is dead, even if no error came.
+    static let stallTimeout: TimeInterval = 10
     /// How long `close` waits for FCUnpublish and deleteStream to go out before cancelling anyway.
     static let closeTimeout: TimeInterval = 2
 
@@ -68,8 +70,16 @@ final class RTMPConnection {
     private static let fcPublishTransaction: Double = 3
 
     var onState: ((State) -> Void)?
+    /// Set before `start`.
+    var connectTimeout = RTMPConnection.connectTimeout
+    /// Set before `start`.
+    var stallTimeout = RTMPConnection.stallTimeout
     private(set) var sentBytes = 0
     var droppedVideoFrames: Int { sendQueue.droppedVideoFrames }
+    /// True while the network is too slow and video is being thrown away.
+    var isDropping: Bool { sendQueue.isDropping }
+    /// The failure was the server saying no (`_error`, a refused publish), not the network.
+    private(set) var refusedByServer = false
 
     private let target: Target
     private let queue: DispatchQueue
@@ -79,6 +89,9 @@ final class RTMPConnection {
     private var closing = false
     private var closeCompletions: [() -> Void] = []
     private var connectDeadline: DispatchWorkItem?
+    /// Why the network is still trying, shown if the connect deadline passes.
+    private var waitingError: String?
+    private var sendStarted = 0.0
 
     private var handshake: [UInt8] = []
     private var sentC2 = false
@@ -127,10 +140,11 @@ final class RTMPConnection {
             connection.start(queue: queue)
             let deadline = DispatchWorkItem { [weak self] in
                 guard let self, self.state == .connecting else { return }
-                self.fail("No answer from the server")
+                self.fail(self.waitingError ?? "No answer from the server")
             }
             connectDeadline = deadline
-            queue.asyncAfter(deadline: .now() + Self.connectTimeout, execute: deadline)
+            queue.asyncAfter(deadline: .now() + connectTimeout, execute: deadline)
+            watchSends()
         }
     }
 
@@ -147,9 +161,9 @@ final class RTMPConnection {
             guard canSendMedia, let streamID else { return }
             lastMediaTimestamp = timestamp
             let message = RTMPMessage(type: RTMPMessage.Kind.video.rawValue, streamID: streamID, timestamp: timestamp, payload: video)
-            // The decoder can't start without the sequence header, so the queue must never drop it.
-            let isSequenceHeader = video.count >= 2 && video[video.startIndex + 1] == 0
-            enqueue(message, chunkStream: Self.videoChunkStream, isVideo: !isSequenceHeader, keyframe: keyframe)
+            sendQueue.enqueue(Self.videoItem(video, bytes: writer.chunks(for: message, chunkStreamID: Self.videoChunkStream),
+                                             timestamp: timestamp, keyframe: keyframe))
+            pump()
         }
     }
 
@@ -203,6 +217,12 @@ final class RTMPConnection {
         onState?(new)
     }
 
+    private func refuse(_ text: String) {
+        guard !isFinished else { return }
+        refusedByServer = true
+        fail(text)
+    }
+
     private func fail(_ text: String) {
         guard !isFinished else { return }
         if closing {
@@ -237,8 +257,10 @@ final class RTMPConnection {
             receive()
         case .failed(let error):
             fail(redact(Self.describe(error)))
+        case .waiting(let error):
+            // Retries by itself; the connect deadline bounds it.
+            waitingError = redact(Self.describe(error))
         default:
-            // `.waiting` retries by itself; the connect deadline bounds it.
             break
         }
     }
@@ -298,6 +320,8 @@ final class RTMPConnection {
             chunkBytes = Data(handshake[whole...])
             handshake = []
             handshakeDone = true
+            // A close during the handshake ends it: no connect after that.
+            if closing { return }
             beginSession()
         }
         guard !chunkBytes.isEmpty else { return }
@@ -341,6 +365,8 @@ final class RTMPConnection {
     }
 
     private func handleCommand(_ payload: Data) {
+        // Once closing, no further step: never publish into a close.
+        if closing { return }
         let values: [AMF0]
         do {
             values = try AMF0.decode(payload)
@@ -380,14 +406,14 @@ final class RTMPConnection {
         case "_error":
             // Errors for releaseStream and FCPublish are historical leftovers some servers send; ignore them.
             if transaction == Self.releaseStreamTransaction || transaction == Self.fcPublishTransaction { return }
-            fail(serverText(info, fallback: "The server refused the connection"))
+            refuse(serverText(info, fallback: "The server refused the connection"))
         case "onStatus":
             if case .string("NetStream.Publish.Start")? = info?["code"], awaiting == .publish {
                 awaiting = nil
                 connectDeadline?.cancel()
                 setState(.publishing)
             } else if case .string("error")? = info?["level"] {
-                fail(serverText(info, fallback: "The server refused the stream"))
+                refuse(serverText(info, fallback: "The server refused the stream"))
             }
         default:
             break
@@ -449,12 +475,19 @@ final class RTMPConnection {
         enqueue(message, chunkStream: Self.commandChunkStream)
     }
 
-    private func enqueue(_ message: RTMPMessage, chunkStream: UInt8, isVideo: Bool = false, keyframe: Bool = false) {
+    /// Anything but video, which `send(video:)` queues itself so the queue can drop it.
+    private func enqueue(_ message: RTMPMessage, chunkStream: UInt8) {
         let bytes = writer.chunks(for: message, chunkStreamID: chunkStream)
         let isMedia = message.type == RTMPMessage.Kind.video.rawValue || message.type == RTMPMessage.Kind.audio.rawValue
         let timestamp = isMedia ? message.timestamp : lastMediaTimestamp
-        sendQueue.enqueue(.init(bytes: bytes, timestamp: timestamp, isVideo: isVideo, isKeyframe: keyframe))
+        sendQueue.enqueue(.init(bytes: bytes, timestamp: timestamp, isVideo: false, isKeyframe: false))
         pump()
+    }
+
+    /// The decoder can't start without the sequence header, so the queue must never drop it: it isn't queued as video.
+    static func videoItem(_ video: Data, bytes: Data, timestamp: UInt32, keyframe: Bool) -> RTMPSendQueue.Item {
+        let isSequenceHeader = video.count >= 2 && video[video.startIndex + 1] == 0
+        return .init(bytes: bytes, timestamp: timestamp, isVideo: !isSequenceHeader, isKeyframe: keyframe)
     }
 
     private func enqueueRaw(_ bytes: Data) {
@@ -470,6 +503,7 @@ final class RTMPConnection {
             return
         }
         sending = true
+        sendStarted = Self.seconds()
         connection.send(content: item.bytes, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
             self.sending = false
@@ -481,4 +515,26 @@ final class RTMPConnection {
             self.pump()
         })
     }
+
+    private static func seconds() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e9 }
+
+    /// A dead network may never report an error: a send it hasn't taken for `stallTimeout` counts as lost.
+    private func watchSends() {
+        let interval = min(1, stallTimeout / 4)
+        queue.asyncAfter(deadline: .now() + interval) { [weak self] in
+            guard let self, !self.isFinished else { return }
+            if self.sending, Self.seconds() - self.sendStarted > self.stallTimeout {
+                self.fail("The network stopped taking data")
+                return
+            }
+            self.watchSends()
+        }
+    }
+}
+
+extension RTMPConnection.Target: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    /// The address without the key, so printing a target never shows it.
+    var description: String { "\(tcUrl) (key hidden)" }
+    var debugDescription: String { description }
+    var customMirror: Mirror { Mirror(self, children: ["tcUrl": tcUrl], displayStyle: .struct) }
 }

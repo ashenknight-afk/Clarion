@@ -93,7 +93,7 @@ struct StreamSettingsSection: View {
                 VStack(alignment: .trailing, spacing: 2) {
                     ForEach(StreamSite.allCases) { site in
                         if let line = status(site, now: context.date) {
-                            Text(line).font(.callout).foregroundStyle(isFailed(site) ? .yellow : .secondary)
+                            Text(line).font(.callout).foregroundStyle(needsAttention(site) ? .yellow : .secondary)
                         }
                     }
                 }
@@ -136,9 +136,13 @@ struct StreamSettingsSection: View {
         }
     }
 
-    private func isFailed(_ site: StreamSite) -> Bool {
-        if case .failed = broadcaster.states[site] { return true }
-        return false
+    /// A failed site, or a live one whose connection can't keep up.
+    private func needsAttention(_ site: StreamSite) -> Bool {
+        switch broadcaster.states[site] ?? .off {
+        case .failed: return true
+        case .live: return broadcaster.info[site] == Broadcaster.slowConnectionText
+        case .off, .connecting, .reconnecting: return false
+        }
     }
 
     private func saveKey(_ site: StreamSite) {

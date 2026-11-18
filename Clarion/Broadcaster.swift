@@ -54,17 +54,22 @@ struct StreamConfig {
 
 /// Sends the finished picture and the game's sound to the streaming sites. Like `Recorder`: control
 /// on the main thread, work on its own queue. A 60 Hz timer there takes the newest frame (or the
-/// last one again), composes it per canvas, encodes it per site and sends it with the mixed sound.
+/// last one again), composes it per canvas, encodes it once per canvas and bitrate and sends it
+/// with the mixed sound to every site. A site that loses its connection reconnects on its own.
 final class Broadcaster: ObservableObject {
     enum SiteState: Equatable { case off, connecting, live, reconnecting(Int), failed(String) }
 
     static let pictureTimeout = 5.0
+    /// A site's info line while its connection is throwing video away.
+    static let slowConnectionText = "Connection too slow"
 
     @Published private(set) var states: [StreamSite: SiteState] = Dictionary(uniqueKeysWithValues: StreamSite.allCases.map { ($0, .off) })
     @Published private(set) var startedAt: Date?
     @Published private(set) var notice: String?
-    /// Bitrate and canvas per site, shown next to its state.
+    /// Bitrate sent and canvas per site, shown next to its state.
     @Published private(set) var info: [StreamSite: String] = [:]
+    /// Checks only: scales reconnect pauses and timeouts. Set before `goLive`.
+    var timeScale = 1.0
 
     var isLive: Bool {
         states.values.contains { state in
@@ -109,6 +114,11 @@ final class Broadcaster: ObservableObject {
     private var lastFrame: CVPixelBuffer?
     private var sitesStarted = false
     private var sites: [StreamSite: BroadcastSite] = [:]
+    private var encoders: [EncoderKey: SharedEncoder] = [:]
+    /// Each site's canvas note ("the picture is smaller than …"), for its info line.
+    private var notes: [StreamSite: String] = [:]
+    private var nextInfo = 0.0
+    private var timeScaleInUse = 1.0
     private var composing: Set<StreamQuality> = []
     private var mixer: StreamMixer?
     private let gameNormalizer = PCMNormalizer()
@@ -137,7 +147,8 @@ final class Broadcaster: ObservableObject {
         accepting = true
         newest = nil
         lock.unlock()
-        queue.async { self.start(config) }
+        let timeScale = self.timeScale
+        queue.async { self.start(config, timeScale: timeScale) }
     }
 
     /// Ends every site cleanly. `completion` runs on the main thread once all are closed.
@@ -232,9 +243,10 @@ final class Broadcaster: ObservableObject {
 
     // MARK: - Queue
 
-    private func start(_ config: StreamConfig) {
+    private func start(_ config: StreamConfig, timeScale: Double) {
         session += 1
         self.config = config
+        timeScaleInUse = timeScale
         running = true
         let now = CACurrentMediaTime()
         pictureDeadline = now + Self.pictureTimeout
@@ -263,8 +275,12 @@ final class Broadcaster: ObservableObject {
         timer = nil
         // The sound still held back by the mixer's delay belongs to the pictures already sent.
         pullSound(now: CACurrentMediaTime() + StreamMixer.delay)
+        // Frames finished by `invalidate` are queued behind this block, so they go out before the sites close.
+        for shared in encoders.values { shared.encoder.invalidate() }
+        encoders = [:]
         let open = Array(sites.values)
         sites = [:]
+        notes = [:]
         config = nil
         lastFrame = nil
         mixer = nil
@@ -309,10 +325,15 @@ final class Broadcaster: ObservableObject {
         }
 
         pullSound(now: now)
+        if now >= nextInfo {
+            nextInfo = now + 1
+            updateInfo(now: now)
+        }
 
         guard let frame = lastFrame, let compositor else { return }
         let session = self.session
-        let canvases = Set(sites.values.map(\.quality))
+        // Only canvases some publishing site is waiting for.
+        let canvases = Set(encoders.filter { $0.value.wantsFrames }.map(\.key.quality))
         let camera = config.camera.flatMap { camera in cameraFrame?().map { ($0, camera.layout) } }
         for quality in canvases where !composing.contains(quality) {
             composing.insert(quality)
@@ -328,7 +349,31 @@ final class Broadcaster: ObservableObject {
         composing.remove(quality)
         guard let canvas else { return }
         onCanvas?(canvas)
-        for site in sites.values where site.quality == quality { site.encode(canvas, at: time) }
+        for (key, shared) in encoders where key.quality == quality && shared.wantsFrames {
+            // A forced keyframe the rate guard drops stays pending in the encoder.
+            let force = shared.keyframeWanted
+            shared.keyframeWanted = false
+            shared.encoder.encode(canvas, at: CMTime(seconds: time, preferredTimescale: 1_000_000_000), forceKeyframe: force)
+        }
+    }
+
+    private func updateInfo(now: Double) {
+        var lines: [StreamSite: String] = [:]
+        for (site, broadcastSite) in sites {
+            let dropped = encoders[EncoderKey(broadcastSite)]?.encoder.droppedFrames ?? 0
+            let rate = broadcastSite.sentBitrate(now: now) ?? Double(broadcastSite.bitrate)
+            lines[site] = Self.infoLine(sentBitrate: rate, quality: broadcastSite.quality, note: notes[site],
+                                        droppedFrames: dropped, tooSlow: broadcastSite.isTooSlow)
+        }
+        DispatchQueue.main.async { self.info = lines }
+    }
+
+    /// One site's info line: what is actually sent, or why it can't be.
+    static func infoLine(sentBitrate: Double, quality: StreamQuality, note: String?, droppedFrames: Int, tooSlow: Bool) -> String {
+        if tooSlow { return slowConnectionText }
+        var text = String(format: "%.1f Mbps · %dp", sentBitrate / 1_000_000, quality.rawValue) + (note ?? "")
+        if droppedFrames > 0 { text += " · \(droppedFrames) frame\(droppedFrames == 1 ? "" : "s") dropped" }
+        return text
     }
 
     private func pullSound(now: Double) {
@@ -346,7 +391,6 @@ final class Broadcaster: ObservableObject {
     private func startSites(_ config: StreamConfig, frameHeight: Int) {
         sitesStarted = true
         let session = self.session
-        var infos: [StreamSite: String] = [:]
         var anyEncodable = false
         for siteConfig in config.sites {
             let site = siteConfig.site
@@ -359,42 +403,111 @@ final class Broadcaster: ObservableObject {
             let bitrate = siteConfig.bitrate > 0 ? siteConfig.bitrate : site.defaultBitrate(quality)
             let broadcastSite: BroadcastSite
             do {
-                broadcastSite = try BroadcastSite(config: siteConfig, quality: quality, bitrate: bitrate, queue: queue)
+                broadcastSite = try BroadcastSite(config: siteConfig, quality: quality, bitrate: bitrate, queue: queue,
+                                                  timeScale: timeScaleInUse)
             } catch {
                 publish(.failed((error as? BroadcastSite.StartError)?.text ?? "Couldn't start"), for: site)
                 continue
             }
-            var text = String(format: "%.1f Mbps · %dp", Double(bitrate) / 1_000_000, quality.rawValue)
+            let key = EncoderKey(broadcastSite)
+            if encoders[key] == nil {
+                guard let shared = makeEncoder(key) else {
+                    publish(.failed("Couldn't start the video encoder"), for: site)
+                    continue
+                }
+                encoders[key] = shared
+            }
+            encoders[key]?.receivers.sites.append(broadcastSite)
             if quality.rawValue < siteConfig.quality.rawValue {
                 let asked = siteConfig.quality
-                text += StreamVideoEncoder.hardwareAvailable(width: asked.size.width, height: asked.size.height)
+                notes[site] = StreamVideoEncoder.hardwareAvailable(width: asked.size.width, height: asked.size.height)
                     ? " (the picture is smaller than \(asked.rawValue)p)" : " (this Mac can't encode \(asked.rawValue)p)"
             }
-            infos[site] = text
             broadcastSite.onState = { [weak self] state in self?.siteChanged(site, state, session: session) }
+            broadcastSite.onNeedsKeyframe = { [weak self] in self?.encoders[key]?.keyframeWanted = true }
             sites[site] = broadcastSite
-            broadcastSite.start()
         }
-        DispatchQueue.main.async { self.info = infos }
+        updateInfo(now: CACurrentMediaTime())
+        nextInfo = CACurrentMediaTime() + 1
         if !anyEncodable { return giveUp("Streaming isn't available on this Mac") }
-        if sites.isEmpty { giveUp(nil) }
+        if sites.isEmpty { return giveUp(nil) }
+        // Started once all are set up, so a site that fails at once can't end the others' session early.
+        for site in sites.values { site.start() }
     }
 
-    private func siteChanged(_ site: StreamSite, _ state: RTMPConnection.State, session: Int) {
-        guard running, session == self.session, sites[site] != nil else { return }
-        switch state {
-        case .publishing:
-            publish(.live, for: site)
-        case .failed(let text):
-            sites[site] = nil
-            publish(.failed(text), for: site)
-            if sites.isEmpty { giveUp(nil) }
-        case .closed:
-            sites[site] = nil
-            publish(.off, for: site)
-            if sites.isEmpty { giveUp(nil) }
-        case .connecting:
-            break
+    /// One encoder for a canvas and bitrate. Its frames go, on the queue, to the sites it holds then:
+    /// a site that ended or has no connection drops them, and frames finished after the session ended still flush.
+    private func makeEncoder(_ key: EncoderKey) -> SharedEncoder? {
+        let receivers = SiteList()
+        let size = key.quality.size
+        // The encoder calls back on a VideoToolbox thread; the sites belong to the queue.
+        guard let encoder = StreamVideoEncoder(width: size.width, height: size.height, bitrate: key.bitrate, frameRate: 60,
+                                               onFrame: { [queue] frame in
+            queue.async { receivers.sites.forEach { $0.encoded(frame) } }
+        }) else { return nil }
+        return SharedEncoder(encoder: encoder, receivers: receivers)
+    }
+
+    private func remove(_ site: StreamSite) {
+        guard let broadcastSite = sites.removeValue(forKey: site) else { return }
+        notes[site] = nil
+        let key = EncoderKey(broadcastSite)
+        guard let shared = encoders[key] else { return }
+        shared.receivers.sites.removeAll { $0 === broadcastSite }
+        if shared.receivers.sites.isEmpty {
+            shared.encoder.invalidate()
+            encoders[key] = nil
         }
     }
+
+    private func siteChanged(_ site: StreamSite, _ state: BroadcastSite.State, session: Int) {
+        guard running, session == self.session, sites[site] != nil else { return }
+        switch state {
+        case .connecting:
+            break
+        case .live:
+            publish(.live, for: site)
+        case .reconnecting(let attempt):
+            publish(.reconnecting(attempt), for: site)
+        case .failed(let text):
+            remove(site)
+            publish(.failed(text), for: site)
+            if sites.isEmpty { giveUp("The stream ended. \(site.label): \(text)") }
+        case .closed:
+            remove(site)
+            publish(.off, for: site)
+            if sites.isEmpty { giveUp(nil) }
+        }
+    }
+}
+
+private struct EncoderKey: Hashable {
+    let quality: StreamQuality
+    let bitrate: Int
+
+    init(_ site: BroadcastSite) {
+        quality = site.quality
+        bitrate = site.bitrate
+    }
+}
+
+/// The sites an encoder's frames go to. Its own object so the encoder's callback can hold it
+/// without holding the encoder, and still deliver what `invalidate` flushes after the session ends.
+private final class SiteList {
+    var sites: [BroadcastSite] = []
+}
+
+/// One video encoder and the sites that share it. Queue only.
+private final class SharedEncoder {
+    let encoder: StreamVideoEncoder
+    let receivers: SiteList
+    /// A site's new connection needs a keyframe; the next frame is encoded as one.
+    var keyframeWanted = false
+
+    init(encoder: StreamVideoEncoder, receivers: SiteList) {
+        self.encoder = encoder
+        self.receivers = receivers
+    }
+
+    var wantsFrames: Bool { receivers.sites.contains { $0.wantsFrames } }
 }

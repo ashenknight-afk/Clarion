@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -89,8 +90,9 @@ private final class Feeder {
         self.large = large
     }
 
-    func start() {
+    func start(large: Bool = false) {
         queue.sync {
+            useLarge = large
             soundStart = CACurrentMediaTime()
             let timer = DispatchSource.makeTimerSource(queue: queue)
             timer.schedule(deadline: .now(), repeating: 1.0 / 60, leeway: .milliseconds(1))
@@ -136,7 +138,64 @@ private func oneSite(_ site: StreamSite = .twitch, quality: StreamQuality = .p10
 
 private func bytes(_ message: RTMPMessage, _ count: Int = 2) -> [UInt8] { Array(message.payload.prefix(count)) }
 
+private func site(_ site: StreamSite, quality: StreamQuality = .p1080, bitrate: Int = 0, port: UInt16, key: String) -> StreamSiteConfig {
+    StreamSiteConfig(site: site, server: "rtmp://127.0.0.1:\(port)/live", key: key, quality: quality, bitrate: bitrate)
+}
+
+private func bothSites(_ twitch: StreamSiteConfig, _ youtube: StreamSiteConfig) -> StreamConfig {
+    StreamConfig(sites: [twitch, youtube], gameVolume: 1, camera: nil, mic: nil)
+}
+
+/// The SPS inside an FLV AVC sequence header (17 00 00 00 00, then the decoder configuration record).
+private func sps(_ header: RTMPMessage) -> [UInt8]? {
+    let bytes = [UInt8](header.payload)
+    guard bytes.count > 13 else { return nil }
+    let length = Int(bytes[11]) << 8 | Int(bytes[12])
+    guard bytes.count >= 13 + length else { return nil }
+    return Array(bytes[13..<13 + length])
+}
+
+/// Every state a site went through, as the main thread saw them.
+private final class StateLog {
+    private(set) var states: [Broadcaster.SiteState] = []
+    private var subscription: AnyCancellable?
+    init(_ broadcaster: Broadcaster, site: StreamSite) {
+        subscription = broadcaster.$states.sink { [weak self] states in
+            guard let self, let state = states[site], self.states.last != state else { return }
+            self.states.append(state)
+        }
+    }
+}
+
+private func ends(_ broadcaster: Broadcaster) throws {
+    var ended = false
+    broadcaster.end { ended = true }
+    try expect(spin(timeout: 5) { ended }, "end didn't complete")
+}
+
 func broadcasterChecks() {
+    check("reconnect pauses are 1, 2, 4, 8, 16 s, then none; reset starts over") {
+        var policy = ReconnectPolicy()
+        var pauses: [Double?] = (0..<6).map { _ in policy.nextPause() }
+        try expect(pauses == [1, 2, 4, 8, 16, nil], "pauses \(pauses)")
+        try expect(policy.nextPause() == nil, "a pause after nil")
+        policy.reset()
+        pauses = [policy.nextPause(), policy.nextPause()]
+        try expect(pauses == [1, 2], "after reset \(pauses)")
+    }
+
+    check("info line shows the sent rate, a smaller canvas, dropped frames and a slow connection") {
+        let line = Broadcaster.infoLine(sentBitrate: 5_840_000, quality: .p1080, note: nil, droppedFrames: 0, tooSlow: false)
+        try expect(line == "5.8 Mbps · 1080p", line)
+        let noted = Broadcaster.infoLine(sentBitrate: 9_000_000, quality: .p1080, note: " (the picture is smaller than 1440p)",
+                                         droppedFrames: 12, tooSlow: false)
+        try expect(noted == "9.0 Mbps · 1080p (the picture is smaller than 1440p) · 12 frames dropped", noted)
+        let one = Broadcaster.infoLine(sentBitrate: 6_000_000, quality: .p1440, note: nil, droppedFrames: 1, tooSlow: false)
+        try expect(one == "6.0 Mbps · 1440p · 1 frame dropped", one)
+        let slow = Broadcaster.infoLine(sentBitrate: 1_000_000, quality: .p1080, note: nil, droppedFrames: 3, tooSlow: true)
+        try expect(slow == "Connection too slow", slow)
+    }
+
     check("drawingTarget copies a shared frame, keeps an unshared one") {
         guard let frame = squareFrame(width: 640, height: 360, index: 3) else { throw CheckFailure(description: "no frame") }
         var pool: CVPixelBufferPool?
@@ -279,5 +338,148 @@ func broadcasterChecks() {
         try expect(broadcaster.notice == "No picture to stream", "notice \(broadcaster.notice ?? "nil")")
         try expect(!broadcaster.isLive, "live without a picture")
         try expect(server.publishedKey == nil, "published without a picture")
+    }
+
+    check("streams to both sites at two canvases") {
+        guard StreamVideoEncoder.hardwareAvailable(width: 2560, height: 1440) else {
+            print("skip: two canvases (no hardware 1440p encoder)")
+            return
+        }
+        let a = try RTMPTestServer(behaviour: .accept), b = try RTMPTestServer(behaviour: .accept)
+        defer { a.stop(); b.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start(large: true)
+        defer { feeder.stop() }
+        broadcaster.goLive(bothSites(site(.twitch, quality: .p1080, port: a.port, key: "ka"),
+                                     site(.youtube, quality: .p1440, port: b.port, key: "kb")))
+        try expect(spin(timeout: 5) { broadcaster.states[.twitch] == .live && broadcaster.states[.youtube] == .live },
+                   "not live: \(broadcaster.states) \(broadcaster.notice ?? "")")
+        spin(timeout: 1)
+        try ends(broadcaster)
+        spin(timeout: 0.3)
+        let headers = [a, b].map { server in server.received.first { $0.type == 9 && bytes($0) == [0x17, 0x00] } }
+        let videos = [a, b].map { server in server.received.filter { $0.type == 9 && (bytes($0) == [0x17, 0x01] || bytes($0) == [0x27, 0x01]) } }
+        try expect(videos.allSatisfy { $0.count > 20 }, "video counts \(videos.map(\.count))")
+        guard let first = headers[0].flatMap(sps), let second = headers[1].flatMap(sps) else {
+            throw CheckFailure(description: "a sequence header is missing")
+        }
+        try expect(first != second, "both sites got the same SPS")
+    }
+
+    check("two sites on one canvas and bitrate get the same video") {
+        let a = try RTMPTestServer(behaviour: .accept), b = try RTMPTestServer(behaviour: .accept)
+        defer { a.stop(); b.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(bothSites(site(.twitch, bitrate: 6_000_000, port: a.port, key: "ka"),
+                                     site(.youtube, bitrate: 6_000_000, port: b.port, key: "kb")))
+        try expect(spin(timeout: 5) { broadcaster.states[.twitch] == .live && broadcaster.states[.youtube] == .live },
+                   "not live: \(broadcaster.states) \(broadcaster.notice ?? "")")
+        spin(timeout: 1.5)
+        try ends(broadcaster)
+        spin(timeout: 0.3)
+        let videos = [a, b].map { server in server.received.filter { $0.type == 9 }.map(\.payload) }
+        try expect(videos[0].first == videos[1].first, "sequence headers differ")
+        // One site may have started a keyframe earlier; from the later start on, both carry the same bytes.
+        let later = videos[0].count >= videos[1].count ? 1 : 0, earlier = 1 - later
+        guard videos[later].count > 1, let start = videos[earlier].firstIndex(of: videos[later][1]) else {
+            throw CheckFailure(description: "the later site's first frame isn't in the other stream")
+        }
+        let shared = Array(zip(videos[earlier][start...], videos[later].dropFirst()))
+        try expect(shared.count > 60, "only \(shared.count) frames in common")
+        try expect(shared.allSatisfy { $0 == $1 }, "payloads differ")
+    }
+
+    check("one site reconnecting leaves the other live") {
+        let a = try RTMPTestServer(behaviour: .dropAfterPublish, stopsListeningOnDrop: true)
+        let b = try RTMPTestServer(behaviour: .accept)
+        defer { a.stop(); b.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        broadcaster.timeScale = 0.01
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(bothSites(site(.twitch, port: a.port, key: "ka"), site(.youtube, port: b.port, key: "kb")))
+        try expect(spin(timeout: 5) { broadcaster.states[.twitch] == .reconnecting(1) },
+                   "twitch \(String(describing: broadcaster.states[.twitch]))")
+        try expect(spin(timeout: 5) { broadcaster.states[.youtube] == .live }, "youtube \(String(describing: broadcaster.states[.youtube]))")
+        let before = b.received.filter { $0.type == 9 }.count
+        spin(timeout: 0.5)
+        let after = b.received.filter { $0.type == 9 }.count
+        try expect(after >= before + 20, "youtube video \(before) -> \(after)")
+        try expect(broadcaster.states[.youtube] == .live, "youtube \(String(describing: broadcaster.states[.youtube]))")
+        try ends(broadcaster)
+    }
+
+    check("a dropped connection comes back live and starts its stream again") {
+        let server = try RTMPTestServer(behaviour: .dropOnceThenAccept)
+        defer { server.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        broadcaster.timeScale = 0.01
+        let log = StateLog(broadcaster, site: .twitch)
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(oneSite(port: server.port, key: "abc"))
+        try expect(spin(timeout: 5) { server.connectionCount == 2 && broadcaster.states[.twitch] == .live },
+                   "states \(log.states) connections \(server.connectionCount)")
+        spin(timeout: 1)
+        try ends(broadcaster)
+        spin(timeout: 0.3)
+        try expect(log.states.contains(.reconnecting(1)), "states \(log.states)")
+        let connections = server.receivedPerConnection
+        guard connections.count == 2 else { throw CheckFailure(description: "\(connections.count) connections") }
+        try expect(connections[1].contains { $0.type == 20 && (try? AMF0.decode($0.payload).first) == .string("publish") },
+                   "no publish on the new connection")
+        let media = connections[1].filter { [8, 9, 18].contains($0.type) }
+        try expect(media.count > 10, "only \(media.count) media messages")
+        try expect(media[0].type == 18, "first is not metadata: type \(media[0].type)")
+        try expect(media[1].type == 9 && bytes(media[1]) == [0x17, 0x00], "second is not the AVC header: \(bytes(media[1]))")
+        try expect(media[2].type == 8 && bytes(media[2]) == [0xAF, 0x00], "third is not the AAC header: \(bytes(media[2]))")
+        try expect(media[3].type == 9 && bytes(media[3]) == [0x17, 0x01], "fourth is not a keyframe: \(bytes(media[3]))")
+        try expect(media[0...3].allSatisfy { $0.timestamp == 0 }, "start timestamps \(media[0...3].map(\.timestamp))")
+        let video = media.filter { $0.type == 9 }
+        try expect(zip(video, video.dropFirst()).allSatisfy { $0.timestamp <= $1.timestamp }, "video timestamps go backwards")
+        try expect((video.last?.timestamp ?? 0) < 3000, "new connection's clock didn't start at 0: \(video.last?.timestamp ?? 0)")
+    }
+
+    check("a refused publish fails at once, without reconnecting") {
+        let server = try RTMPTestServer(behaviour: .rejectPublish(description: "bad key"))
+        defer { server.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        broadcaster.timeScale = 0.01
+        let log = StateLog(broadcaster, site: .twitch)
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(oneSite(port: server.port, key: "abc"))
+        try expect(spin(timeout: 5) { if case .failed = broadcaster.states[.twitch] { return true } else { return false } },
+                   "states \(log.states)")
+        spin(timeout: 0.3)
+        try expect(!log.states.contains { if case .reconnecting = $0 { return true } else { return false } }, "states \(log.states)")
+        try expect(server.connectionCount == 1, "\(server.connectionCount) connections")
+        try expect(!broadcaster.isLive, "still live")
+        try expect(broadcaster.notice?.contains("bad key") == true, "notice \(broadcaster.notice ?? "nil")")
+    }
+
+    check("after five failed retries the site fails and the stream ends") {
+        let server = try RTMPTestServer(behaviour: .dropAfterPublish, stopsListeningOnDrop: true)
+        defer { server.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        broadcaster.timeScale = 0.01
+        let log = StateLog(broadcaster, site: .twitch)
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(oneSite(port: server.port, key: "abc"))
+        try expect(spin(timeout: 15) { broadcaster.states[.twitch] == .failed("Connection lost") }, "states \(log.states)")
+        try expect(log.states.contains(.reconnecting(5)) && !log.states.contains(.reconnecting(6)), "states \(log.states)")
+        // The notice comes in the main-thread update after the state.
+        spin(timeout: 1) { broadcaster.notice != nil }
+        try expect(!broadcaster.isLive, "still live")
+        try expect(broadcaster.notice?.contains("Connection lost") == true, "notice \(broadcaster.notice ?? "nil")")
     }
 }
