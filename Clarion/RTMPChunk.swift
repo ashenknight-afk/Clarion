@@ -52,11 +52,19 @@ struct RTMPChunkWriter {
 /// Reassembles messages from a peer's chunks. Bytes come from a remote server, so message
 /// length and chunk size are bounded to keep a hostile one from making it allocate without limit.
 struct RTMPChunkReader {
-    enum ReadError: Error { case messageTooLong(Int), badChunkSize(UInt32), malformed }
+    enum ReadError: Error {
+        case messageTooLong(Int), badChunkSize(UInt32), tooManyChunkStreams, tooManyBytesHeld, malformed
+    }
 
     /// 16 MB. A 16 MiB cap could never trip, since the 3-byte length field tops out at 16,777,215.
     static let maxMessageLength = 16_000_000
     static let chunkSizeRange: ClosedRange<UInt32> = 1...16_777_215
+    /// Servers use a handful; the cap and the byte budget stop a peer from holding partial
+    /// messages open on many chunk streams at once.
+    static let maxChunkStreams = 64
+    /// Partial payloads plus unparsed bytes. One maximum-size message stays under it: its partial
+    /// payload and the rest of it waiting in the buffer never exceed its own length.
+    static let maxBytesHeld = 2 * maxMessageLength
 
     /// What the last header on a chunk stream said; later headers leave out what is unchanged.
     private struct StreamState {
@@ -72,6 +80,7 @@ struct RTMPChunkReader {
     private var chunkSize = 128
     private var buffer: [UInt8] = []
     private var streams: [UInt32: StreamState] = [:]
+    private var partialBytes = 0
 
     mutating func append(_ bytes: Data) throws -> [RTMPMessage] {
         buffer.append(contentsOf: bytes)
@@ -90,6 +99,7 @@ struct RTMPChunkReader {
             }
         }
         buffer.removeFirst(position)
+        guard partialBytes + buffer.count <= Self.maxBytesHeld else { throw ReadError.tooManyBytesHeld }
         return messages
     }
 
@@ -117,6 +127,7 @@ struct RTMPChunkReader {
         let continuing = !state.payload.isEmpty
         if continuing && format != 3 { throw ReadError.malformed }
         if streams[csid] == nil && format != 0 { throw ReadError.malformed }
+        if streams[csid] == nil && streams.count >= Self.maxChunkStreams { throw ReadError.tooManyChunkStreams }
 
         var field: UInt32?
         switch format {
@@ -161,11 +172,13 @@ struct RTMPChunkReader {
             }
         }
         state.payload.append(contentsOf: buffer[p..<p + count])
+        partialBytes += count
         p += count
 
         var message: RTMPMessage?
         if state.payload.count == state.length {
             message = RTMPMessage(type: state.type, streamID: state.streamID, timestamp: state.timestamp, payload: state.payload)
+            partialBytes -= state.length
             state.payload = Data()
         }
         streams[csid] = state

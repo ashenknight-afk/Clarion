@@ -113,6 +113,76 @@ func rtmpChunkChecks() {
         try expect(try reader.append(Data(bytes)) == [expected])
     }
 
+    func basicHeader(_ format: UInt8, _ csid: Int) -> [UInt8] {
+        csid < 64 ? [format << 6 | UInt8(csid)] : [format << 6, UInt8(csid - 64)]
+    }
+    func type0(_ csid: Int, length: Int) -> [UInt8] {
+        basicHeader(0, csid) + [0, 0, 0, UInt8(length >> 16), UInt8(truncatingIfNeeded: length >> 8),
+                                UInt8(truncatingIfNeeded: length), 9, 1, 0, 0, 0]
+    }
+    func throwsError(_ body: () throws -> Void) -> Bool {
+        do { try body() } catch { return true }
+        return false
+    }
+
+    check("rtmp chunk reader caps open chunk streams") {
+        var reader = RTMPChunkReader()
+        for csid in 2..<(2 + RTMPChunkReader.maxChunkStreams) {
+            try expect(try reader.append(Data(type0(csid, length: 1) + [7])).count == 1, "csid \(csid)")
+        }
+        let next = 2 + RTMPChunkReader.maxChunkStreams
+        try expect(throwsError { _ = try reader.append(Data(type0(next, length: 1) + [7])) }, "csid \(next)")
+    }
+    check("rtmp chunk reader caps bytes held across chunk streams") {
+        let setSize = RTMPMessage(type: 1, streamID: 0, timestamp: 0, payload: Data([0, 0x0F, 0x42, 0x40]))  // 1,000,000
+        let piece = [UInt8](repeating: 1, count: 1_000_000)
+        var reader = RTMPChunkReader()
+        _ = try reader.append(RTMPChunkWriter().chunks(for: setSize, chunkStreamID: 2))
+        // Three 15,000,000-byte messages, 11 MB of each sent: 33 MB held, over the 32 MB budget.
+        var threw = false
+        for csid in [4, 5, 6] where !threw {
+            for index in 0..<11 where !threw {
+                let header = index == 0 ? type0(csid, length: 15_000_000) : basicHeader(3, csid)
+                threw = throwsError { _ = try reader.append(Data(header + piece)) }
+                try expect(!threw || (csid == 6 && index == 10), "threw early at csid \(csid) piece \(index)")
+            }
+        }
+        try expect(threw)
+    }
+    check("rtmp chunk reader accepts a maximum-size message") {
+        let m = message(RTMPChunkReader.maxMessageLength)
+        for size in [4096, 16_777_215] {
+            var writer = RTMPChunkWriter()
+            writer.chunkSize = size
+            var reader = RTMPChunkReader()
+            let setSize = RTMPMessage(type: 1, streamID: 0, timestamp: 0,
+                                      payload: Data(withUnsafeBytes(of: UInt32(size).bigEndian, Array.init)))
+            var received = try reader.append(RTMPChunkWriter().chunks(for: setSize, chunkStreamID: 2))
+            // Fed in 64 KB reads, as a socket would deliver it.
+            let bytes = writer.chunks(for: m, chunkStreamID: 6)
+            var offset = bytes.startIndex
+            while offset < bytes.endIndex {
+                let end = min(offset + 65536, bytes.endIndex)
+                received += try reader.append(bytes[offset..<end])
+                offset = end
+            }
+            try expect(received == [setSize, m], "chunk size \(size)")
+        }
+    }
+    check("rtmp chunk reader interleaved chunk streams") {
+        let a = message(300, type: 8, timestamp: 10)
+        let b = message(300, type: 9, timestamp: 20)
+        let ca = [UInt8](RTMPChunkWriter().chunks(for: a, chunkStreamID: 4))
+        let cb = [UInt8](RTMPChunkWriter().chunks(for: b, chunkStreamID: 6))
+        // Chunk boundaries: 12 + 128, 1 + 128, 1 + 44.
+        let cuts = [0, 140, 269, 314]
+        var bytes: [UInt8] = []
+        for i in 0..<3 { bytes += ca[cuts[i]..<cuts[i + 1]] + cb[cuts[i]..<cuts[i + 1]] }
+        var reader = RTMPChunkReader()
+        try expect(try reader.append(Data(bytes)) == [a, b])
+        try expect(try reader.append(RTMPChunkWriter().chunks(for: message(5000), chunkStreamID: 6)) == [message(5000)])
+    }
+
     typealias Item = RTMPSendQueue.Item
     func video(_ ts: UInt32, key: Bool = false) -> Item { Item(bytes: Data([1]), timestamp: ts, isVideo: true, isKeyframe: key) }
     func audio(_ ts: UInt32) -> Item { Item(bytes: Data([2]), timestamp: ts, isVideo: false, isKeyframe: false) }
