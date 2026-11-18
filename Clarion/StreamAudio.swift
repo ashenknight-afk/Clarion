@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import CoreMedia
 
@@ -103,11 +104,13 @@ struct StreamMixer {
     private static let rate = 48_000.0
     /// Sound further ahead of the output than this is a bad timestamp, not something to hold on to.
     private static let farAhead = Int(2 * rate)
-    /// Smoothed disagreement (frames) under this is left alone; above it (and under `resyncAfter`) it is eased out.
-    private static let deadband = 96.0
-    /// How long the disagreement is averaged over before it is acted on, so jitter on a source with a
+    /// Smoothed disagreement (frames) under this is left alone, about 6 sigma of the average for ±8 ms jitter; above it (and under `resyncAfter`) it is eased out.
+    private static let deadband = 144.0
+    /// How long the disagreement is averaged over before it is acted on (long against ±10 ms jitter, short against drift), so jitter on a source with a
     /// correct clock averages out and only a real rate difference gets corrected.
-    private static let smoothing = 1.0
+    private static let smoothing = 4.0
+    /// Time spent measuring the reference offset after (re)alignment, before anything is corrected.
+    private static let warmup = 3.0
 
     var volume: [Source: Float] = [.game: 1, .mic: 1]
     var micMuted = false
@@ -117,9 +120,9 @@ struct StreamMixer {
         var queue: [Float] = []
         /// Output frame (from the start) where this source's timeline ends. Nil until it first pushes.
         var endFrame: Int?
-        /// Frames pushed since the last (re)alignment. The first second only measures `reference`.
+        /// Frames pushed since the last (re)alignment. The first seconds only measure `reference`.
         var warmFrames = 0
-        /// Average disagreement (frames) over that first second: the anchor was one jittered stamp, so
+        /// Average disagreement (frames) over those first seconds: the anchor was one jittered stamp, so
         /// an offset that stays constant is not drift and is left alone.
         var reference = 0.0
         /// Running average of the disagreement beyond `reference`, in frames.
@@ -151,7 +154,9 @@ struct StreamMixer {
         guard frames > 0, hostTime.isFinite else { return }
         let position = (hostTime - startHostTime) * Self.rate
         guard abs(position) < 1e12 else { return }
-        var track = tracks[source] ?? Track()
+        // Taken out of the dictionary so the queue is not copied when it is changed.
+        var track = tracks.removeValue(forKey: source) ?? Track()
+        defer { if track.endFrame != nil { tracks[source] = track } }
         let target = Int(position.rounded())
         var data = samples[0..<(frames * 2)]
 
@@ -172,14 +177,14 @@ struct StreamMixer {
                 track.smoothed = 0
                 track.reference = 0
                 track.warmFrames = 0
-            } else if track.warmFrames < Int(Self.rate * Self.smoothing) {
+            } else if track.warmFrames < Int(Self.rate * Self.warmup) {
                 track.reference += (Double(diff) - track.reference) * Double(frames) / Double(track.warmFrames + frames)
                 track.warmFrames += frames
             } else {
                 let error = Double(diff) - track.reference
                 track.smoothed += (error - track.smoothed) * min(1, Double(frames) / (Self.rate * Self.smoothing))
             }
-            if abs(diff) <= Int(Self.resyncAfter * Self.rate), track.warmFrames >= Int(Self.rate * Self.smoothing),
+            if abs(diff) <= Int(Self.resyncAfter * Self.rate), track.warmFrames >= Int(Self.rate * Self.warmup),
                abs(track.smoothed) > Self.deadband {
                 // Clock drift: ease it out a little per push, so a source that is slightly fast or
                 // slow neither piles up nor needs a realignment click every few seconds.
@@ -206,7 +211,6 @@ struct StreamMixer {
         // The part before what was already emitted is too late to use.
         let head = track.endFrame! - track.queue.count / 2
         if head < emitted { track.queue.removeFirst(min(emitted - head, track.queue.count / 2) * 2) }
-        tracks[source] = track
     }
 
     mutating func remove(_ source: Source) {
@@ -228,7 +232,7 @@ struct StreamMixer {
         let block = Self.blockFrames
         var mix = [Float](repeating: 0, count: block * 2)
         for source in Source.allCases {
-            guard var track = tracks[source], let end = track.endFrame else { continue }
+            guard var track = tracks.removeValue(forKey: source), let end = track.endFrame else { continue }
             var gain = volume[source] ?? 1
             if source == .mic && micMuted { gain = 0 }
             var head = end - track.queue.count / 2
@@ -242,13 +246,20 @@ struct StreamMixer {
             let take = min(block - skip, track.queue.count / 2)
             if take > 0 {
                 if gain != 0 {
-                    for i in 0..<(take * 2) { mix[skip * 2 + i] += track.queue[i] * gain }
+                    mix.withUnsafeMutableBufferPointer { dst in
+                        track.queue.withUnsafeBufferPointer { src in
+                            var g = gain
+                            let at = dst.baseAddress! + skip * 2
+                            vDSP_vsma(src.baseAddress!, 1, &g, at, 1, at, 1, vDSP_Length(take * 2))
+                        }
+                    }
                 }
                 track.queue.removeFirst(take * 2)
             }
             tracks[source] = track
         }
-        for i in 0..<mix.count { mix[i] = max(-1, min(1, mix[i])) }
+        var low: Float = -1, high: Float = 1
+        vDSP_vclip(mix, 1, &low, &high, &mix, 1, vDSP_Length(mix.count))
         return mix
     }
 }

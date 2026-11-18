@@ -37,6 +37,18 @@ private func int16MonoBuffer(frames: Int, sampleRate: Double) -> CMSampleBuffer?
     return sample
 }
 
+/// Small deterministic generator so jitter runs repeat.
+private struct SplitMix64: RandomNumberGenerator {
+    var state: UInt64
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}
+
 func streamAudioChecks() {
     let start = 1000.0
 
@@ -128,53 +140,59 @@ func streamAudioChecks() {
     }
 
     /// Runs a 100 Hz sine through the mixer and counts places where it is not smooth (a held or skipped frame).
-    func discontinuities(chunk: Double, jitter: Double, rateRatio: Double, seconds: Double,
-                         bound: Double? = nil) -> (breaks: Int, worstLead: Double) {
+    func discontinuities(chunk: Double, jitter: Double, rateRatio: Double, seconds: Double, seed: UInt64 = 1) -> (breaks: Int, worstLead: Double) {
         var mixer = StreamMixer(startHostTime: start)
-        var rng = SystemRandomNumberGenerator()
+        var rng = SplitMix64(state: seed)
         let frames = Int(chunk * rate)
-        var n = 0, t = 0.0
+        // One period of the 100 Hz sine (480 frames) is all the signal there is.
+        let period: [Float] = (0..<480).map { Float(0.5 * sin(2 * Double.pi * Double($0) / 480)) }
+        var t = 0.0
         var out: [Float] = []
+        out.reserveCapacity(Int(seconds * rate) * 2 + 4096)
         var worst = 0.0
+        // Buffers are whole periods, so every one holds the same samples and keeps the sine continuous.
+        precondition(frames % 480 == 0)
+        var samples = [Float](repeating: 0, count: frames * 2)
+        for i in 0..<frames {
+            samples[i * 2] = period[i % 480]
+            samples[i * 2 + 1] = period[i % 480]
+        }
         while t < seconds {
-            var samples = [Float](repeating: 0, count: frames * 2)
-            for i in 0..<frames {
-                let v = Float(0.5 * sin(2 * Double.pi * 100 * Double(n + i) / rate))
-                samples[i * 2] = v
-                samples[i * 2 + 1] = v
-            }
-            n += frames
             let host = start + 0.1 + t / rateRatio
             let j = jitter > 0 ? Double.random(in: -jitter...jitter, using: &rng) : 0
             mixer.push(.game, samples: samples, hostTime: host + j)
-            out += flat(mixer.pull(now: host + chunk))
-            worst = max(worst, abs(mixer.timelineEnd(.game)! - (host + chunk)))
+            for block in mixer.pull(now: host + chunk) { out.append(contentsOf: block.samples) }
+            if t > 5 { worst = max(worst, abs(mixer.timelineEnd(.game)! - (host + chunk))) }
             t += chunk
         }
         var breaks = 0
         let from = Int(0.5 * rate)
-        for i in max(from, 2)..<(out.count / 2) {
-            let d2 = out[i * 2] - 2 * out[(i - 1) * 2] + out[(i - 2) * 2]
-            if abs(d2) > 3e-4 { breaks += 1 }
+        out.withUnsafeBufferPointer { o in
+            for i in max(from, 2)..<(o.count / 2) {
+                let d2 = o[i * 2] - 2 * o[(i - 1) * 2] + o[(i - 2) * 2]
+                if abs(d2) > 3e-4 { breaks += 1 }
+            }
         }
         return (breaks, worst)
     }
 
-    check("an in-sync source with 2 ms jitter in 10 ms buffers is untouched") {
-        let r = discontinuities(chunk: 0.01, jitter: 0.002, rateRatio: 1, seconds: 10)
-        try expect(r.breaks == 0, "\(r.breaks) held or skipped frames")
+    for (chunk, jitter) in [(0.01, 0.002), (0.02, 0.005), (0.02, 0.008)] {
+        check("an in-sync source with \(Int(jitter * 1000)) ms jitter in \(Int(chunk * 1000)) ms buffers is untouched, 20 seeds") {
+            for seed in 1...20 {
+                let r = discontinuities(chunk: chunk, jitter: jitter, rateRatio: 1, seconds: 10, seed: UInt64(seed))
+                try expect(r.breaks == 0, "seed \(seed): \(r.breaks) held or skipped frames")
+            }
+        }
     }
 
-    check("an in-sync source with 5 ms jitter in 20 ms buffers is untouched") {
-        let r = discontinuities(chunk: 0.02, jitter: 0.005, rateRatio: 1, seconds: 10)
-        try expect(r.breaks == 0, "\(r.breaks) held or skipped frames")
-    }
-
-    check("a fast source with 2 ms jitter stays bounded and is corrected gently") {
-        let r = discontinuities(chunk: 0.02, jitter: 0.002, rateRatio: 1.001, seconds: 60)
-        try expect(r.worstLead <= 0.1, "lead \(r.worstLead) s")
-        // 0.1% of 60 s is about 2900 frames to remove, each showing as two or so; chasing jitter would be far more.
-        try expect(r.breaks < 6500, "\(r.breaks) corrections")
+    for ratio in [1.001, 0.999] {
+        check("a source \(ratio > 1 ? "fast" : "slow") by 0.1% with 5 ms jitter converges gently") {
+            let r = discontinuities(chunk: 0.02, jitter: 0.005, rateRatio: ratio, seconds: 60, seed: 7)
+            // The host clock against the timeline end: 20 ms is half the resync distance.
+            try expect(r.worstLead <= 0.02, "lead \(r.worstLead) s after 5 s")
+            // 0.1% of 57 s is about 2700 frames to remove, each showing as two or so; chasing jitter would be far more.
+            try expect(r.breaks > 1500 && r.breaks < 6500, "\(r.breaks) breaks")
+        }
     }
 
     check("non-finite times are ignored") {
