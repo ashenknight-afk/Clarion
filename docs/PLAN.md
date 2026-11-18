@@ -14,8 +14,10 @@ streaming app ─▶ ScreenCaptureKit window capture (420v, 16:9 crop of the win
         ─▶ CAMetalLayer (2 drawables, framebufferOnly, V-Sync toggle) ─▶ present
 ```
 
-Without frame generation each frame renders on the capture thread the moment it arrives. At most
-one frame is in flight; if the GPU is still busy, the new frame is dropped, not queued.
+Without frame generation the capture thread hands each frame to a present queue and returns. That
+queue waits until the screen can take a frame and then draws the newest one; an older frame still
+waiting is replaced, not queued. If every frame ends up waiting for the screen, one is left out to
+empty the display's queue.
 
 With frame generation the capture thread only queues GPU work. A separate queue presents the
 generated frame, then the real one a refresh later, from three drawables.

@@ -108,7 +108,8 @@ final class AppSettings: ObservableObject {
         RenderConfig(scalingMode: scalingMode, upscaling: upscalingEnabled, upscaler: upscaler,
                      sharpening: sharpeningEnabled, sharpness: Float(effectiveSharpness),
                      frameGeneration: frameGenerationEnabled, fastFrameGeneration: frameGenerationFast,
-                     steadyFrameGeneration: frameGenerationSteady,
+                     // A capture card delivers no late frames to cover for.
+                     steadyFrameGeneration: frameGenerationSteady && source == .window,
                      latencyTest: latencyTest)
     }
 

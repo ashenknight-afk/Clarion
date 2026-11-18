@@ -245,10 +245,12 @@ struct SettingsView: View {
                         Text("Fast makes the in-between frames at 720p: about 10 ms less delay. Real frames, and anything that holds still such as the HUD, stay full resolution.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
-                        Toggle("Steadier motion", isOn: $settings.frameGenerationSteady)
-                        Text("Streams deliver some frames late. On: one frame waits ready to cover for them, which can add about 17 ms on a 60 Hz screen. Off: lowest delay, with a few more small hitches a second.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
+                        if settings.source == .window {
+                            Toggle("Steadier motion", isOn: $settings.frameGenerationSteady)
+                            Text("Streams deliver some frames late. On: one frame waits ready to cover for them, which can add about 17 ms on a 60 Hz screen. Off: lowest delay, with a few more small hitches a second.")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     Label("Adds latency: each real frame waits half a frame (about 17 ms at 30 fps) plus processing, so an in-between frame can be shown first. Best for exploring; turn it off for tight timing.",
                           systemImage: "exclamationmark.triangle")

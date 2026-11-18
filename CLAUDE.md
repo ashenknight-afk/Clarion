@@ -13,7 +13,20 @@ dependencies, no drivers, sandboxed. macOS 14+, Apple Silicon first, Intel must 
 - Capture uncompressed (420v, then YUY2/UYVY). MJPEG only when the user picks it.
 - `alwaysDiscardsLateVideoFrames = true`; frames are handled on a dedicated `.userInteractive` serial queue.
 - Zero copy: CVPixelBuffer → CVMetalTextureCache → MTLTexture. No CPU copies, no CIImage.
-- Render on frame arrival; max 1 frame in flight; CAMetalLayer `maximumDrawableCount = 2`, `framebufferOnly = true`.
+- Max 1 frame in flight; CAMetalLayer `maximumDrawableCount = 2`, `framebufferOnly = true`. The capture thread never
+  draws: it leaves the frame for `presentQueue`, which waits for a drawable and only then takes the newest frame
+  (`presentPendingFrame`). Choosing the frame first and then waiting cost a refresh or more on a capture card, whose
+  clock isn't the display's (MS2130, 1080p60, V-Sync on: 81–89 ms → 60–72; in the app 63). With V-Sync off there is
+  no wait at all (31 ms reported, but `presentedTime` is then the handover, not the glass).
+  A source as fast as the display can also settle into waiting for a drawable on every frame, and deeper queue states
+  than that (67–87 ms seen). After 30 such frames `presentPendingFrame` leaves one frame out, which usually moves it to
+  the state where a drawable is free on arrival (55–66 ms over six runs; it depends on the phase between card and
+  display, and at some phases the wait comes straight back, so retries back off to 30 s).
+  Tried and dropped: sleeping after `nextDrawable` to draw nearer the compositor's cut-off. Its gain came only from
+  the sleep emptying the queue once, which the left-out frame does without guessing the cut-off (drawing 2 ms before
+  the vblank missed it: 67 ms).
+  The card's YUY2 mode arrives ~6 ms sooner than 420v (19.7 vs 25.8 ms after its timestamp) and runs a little under
+  60 fps, so its queue empties by itself: 43–60 ms, sawtooth, as the phase drifts.
   Exception: frame generation uses 3 drawables and presents from `presentQueue`, never blocking the capture thread
   (measured on M3: 2 drawables or presenting on the capture thread gives 30 fps in → only ~40 out). When it can't
   interpolate (source already fast, unsupported size) frames take the normal direct path.
@@ -33,6 +46,18 @@ dependencies, no drivers, sandboxed. macOS 14+, Apple Silicon first, Intel must 
 - The real frame follows its generated frame by whole refreshes minus a quarter (`hold`), never by the smoothed half
   period: 17–18 ms on a 60 Hz screen means two refreshes, pairs then take three, and the queue saturates. Stage timing on
   the real stream after this fix: 3 ms handover + ~10 ms drawables + ~48 ms from commit to screen = 60 ms, steady. Don't remove any of this or "fix" the occasional skipped frame.
+- Capture card + frame generation (MS2130, 30 fps game, Fast): floor about 80 ms = the direct path plus one refresh.
+  Full (1080p) with MetalFX upscaling costs ~10 ms more than Fast (23 vs 12 ms GPU a frame) but keeps 60 fps, at
+  1440p30 too (32 ms GPU, 120 ms). Numbers like "40 fps out at 130 ms" came from two copies sharing the card and GPU:
+  close the app before measuring with a harness. V-Sync
+  off makes frame generation worse (83–96 ms with drops): its pacing relies on `present(afterMinimumDuration:)`.
+  "Steadier motion" is forced off for a card (no late frames to cover).
+  Tried and dropped: a governor margin of 0.6 refresh when steady is off, to clear a single queued frame. The delay
+  also moves by up to a refresh as the card's phase drifts against the display, which that margin reads as a queue:
+  it skipped constantly (recordings: 46–56 fps shown, 4–9 hitches a second, against 60 and none with refresh + 3).
+  Same cause, second bug: the governor used to hold its skip share while the delay sat between 0.6 and 1 margin above
+  the floor. A card whose phase parks the delay in that band kept half the generated frames out for good (recording:
+  46 fps for 40 s). The share now always decays there, and "skipping doesn't help" is concluded after 4 s, not 8.
 - `RepeatDetector` learns the stream's real/repeat rhythm per refresh slot (Remote Play: real frames change 0.20–0.36,
   touched-up repeats 0–0.13 on the probe scale). A fixed "30% of a real frame" rule let enough repeats through to read
   a 30 fps game as 32–40 fps.

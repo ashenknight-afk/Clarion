@@ -135,13 +135,18 @@ final class AudioPassthrough: NSObject, ObservableObject {
         }
     }
 
-    /// "UVC Camera VendorID_0x345F ProductID_0x2130" → ["345f", "2130"].
-    private static func usbIDs(in modelID: String) -> [String] {
-        let pattern = #"(?:VendorID|ProductID)_0x([0-9A-Fa-f]+)"#
+    /// "UVC Camera VendorID_0x345F ProductID_0x2130" → ["345f", "2130"]. Newer macOS versions write
+    /// the same IDs in decimal ("VendorID_13407 ProductID_8496"), while the audio half of the device
+    /// keeps hex ("USB3 Digital Audio:345F:2130").
+    static func usbIDs(in modelID: String) -> [String] {
+        let pattern = #"(?:VendorID|ProductID)_(0x[0-9A-Fa-f]+|[0-9]+)"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
         let range = NSRange(modelID.startIndex..., in: modelID)
         return regex.matches(in: modelID, range: range).compactMap { match in
-            Range(match.range(at: 1), in: modelID).map { modelID[$0].lowercased() }
+            guard let found = Range(match.range(at: 1), in: modelID) else { return nil }
+            let text = modelID[found].lowercased()
+            if text.hasPrefix("0x") { return String(text.dropFirst(2)) }
+            return Int(text).map { String(format: "%04x", $0) }
         }
     }
 
