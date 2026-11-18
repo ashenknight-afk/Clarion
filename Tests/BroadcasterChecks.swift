@@ -83,7 +83,7 @@ private final class Feeder {
     init?(broadcaster: Broadcaster) {
         self.broadcaster = broadcaster
         let small = (0..<10).compactMap { squareFrame(width: 1280, height: 720, index: $0) }
-        let large = (0..<10).compactMap { squareFrame(width: 1920, height: 1080, index: $0) }
+        let large = (0..<10).compactMap { squareFrame(width: 2560, height: 1440, index: $0) }
         guard small.count == 10, large.count == 10 else { return nil }
         self.small = small
         self.large = large
@@ -128,9 +128,9 @@ private final class Locked<Value> {
     func update(_ change: (inout Value) -> Void) { lock.lock(); change(&stored); lock.unlock() }
 }
 
-private func twitch(port: UInt16, key: String) -> StreamConfig {
-    StreamConfig(sites: [StreamSiteConfig(site: .twitch, server: "rtmp://127.0.0.1:\(port)/live", key: key,
-                                          quality: .p1080, bitrate: 0)],
+private func oneSite(_ site: StreamSite = .twitch, quality: StreamQuality = .p1080, port: UInt16, key: String) -> StreamConfig {
+    StreamConfig(sites: [StreamSiteConfig(site: site, server: "rtmp://127.0.0.1:\(port)/live", key: key,
+                                          quality: quality, bitrate: 0)],
                  gameVolume: 1, camera: nil, mic: nil)
 }
 
@@ -167,6 +167,8 @@ func broadcasterChecks() {
             print("skip: keychain checks (the keychain wants interaction)")
             return
         }
+        // The item is this run's own (the account carries the process id); never leave it behind.
+        defer { StreamKeychain.set(nil, for: .youtube) }
         let added = StreamKeychain.set("check-key-123", for: .youtube)
         if StreamKeychain.needsInteraction(added) {
             print("skip: keychain checks (the keychain wants interaction)")
@@ -199,7 +201,7 @@ func broadcasterChecks() {
 
     check("go live without a key or a site says what is missing") {
         let broadcaster = Broadcaster(device: device, library: library)
-        broadcaster.goLive(twitch(port: 1935, key: "  "))
+        broadcaster.goLive(oneSite(port: 1935, key: "  "))
         spin(timeout: 0.1)
         try expect(!broadcaster.isLive, "went live without a key")
         try expect(broadcaster.notice == "Add a Twitch stream key in Settings", "notice \(broadcaster.notice ?? "nil")")
@@ -223,17 +225,22 @@ func broadcasterChecks() {
         feeder.start()
         defer { feeder.stop() }
 
-        broadcaster.goLive(twitch(port: server.port, key: " abc \n"))
-        try expect(spin(timeout: 5) { broadcaster.states[.twitch] == .live },
-                   "not live: \(String(describing: broadcaster.states[.twitch])) \(broadcaster.notice ?? "")")
+        // YouTube asks for 1440p; a 720p picture gets 1080p, and a 1440p picture later must not change it.
+        broadcaster.goLive(oneSite(.youtube, quality: .p1440, port: server.port, key: " abc \n"))
+        try expect(spin(timeout: 5) { broadcaster.states[.youtube] == .live },
+                   "not live: \(String(describing: broadcaster.states[.youtube])) \(broadcaster.notice ?? "")")
+        try expect(broadcaster.info[.youtube]?.hasPrefix("9.0 Mbps · 1080p") == true, "info \(broadcaster.info[.youtube] ?? "nil")")
         spin(timeout: 1.5)
         feeder.switchToLarge()
         spin(timeout: 1.5)
-        try expect(broadcaster.states[.twitch] == .live, "after the size change: \(String(describing: broadcaster.states[.twitch]))")
-        var ended = false
+        try expect(broadcaster.states[.youtube] == .live, "after the size change: \(String(describing: broadcaster.states[.youtube]))")
+        var ended = false, endedAgain = false
         broadcaster.end { ended = true }
-        try expect(spin(timeout: 5) { ended }, "end didn't complete")
-        try expect(!broadcaster.isLive && broadcaster.states[.twitch] == .off, "still live after end")
+        // A second end (quitting while ending) waits for the same close.
+        broadcaster.end { endedAgain = true }
+        try expect(!endedAgain, "second end completed before the first")
+        try expect(spin(timeout: 5) { ended && endedAgain }, "end didn't complete: \(ended) \(endedAgain)")
+        try expect(!broadcaster.isLive && broadcaster.states[.youtube] == .off, "still live after end")
         try expect(wants.value.first == true && wants.value.last == false, "frame wants \(wants.value)")
         spin(timeout: 0.3)
 
@@ -265,7 +272,7 @@ func broadcasterChecks() {
         defer { server.stop() }
         let broadcaster = Broadcaster(device: device, library: library)
         let started = Date()
-        broadcaster.goLive(twitch(port: server.port, key: "abc"))
+        broadcaster.goLive(oneSite(port: server.port, key: "abc"))
         try expect(broadcaster.isLive, "not starting")
         try expect(spin(timeout: 7) { broadcaster.notice != nil }, "no notice")
         try expect(Date().timeIntervalSince(started) > 4.8, "gave up after \(Date().timeIntervalSince(started)) s")

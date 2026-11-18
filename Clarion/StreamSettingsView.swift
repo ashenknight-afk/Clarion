@@ -1,3 +1,4 @@
+import Security
 import SwiftUI
 
 /// The "Live stream" section of Settings: sites, keys, game volume, the go-live button and each site's state.
@@ -12,6 +13,8 @@ struct StreamSettingsSection: View {
         @Published var drafts: [StreamSite: String] = [:]
         @Published var savedKeys: [StreamSite: Bool] = [:]
         @Published var showAdvanced = false
+        /// Set when the keychain refused a save or a removal. Never contains the key.
+        @Published var keyError: String?
     }
 
     @StateObject private var model = Model()
@@ -48,8 +51,8 @@ struct StreamSettingsSection: View {
                         .onSubmit { saveKey(site) }
                     if model.savedKeys[site] == true {
                         Button("Remove") {
-                            StreamKeychain.set(nil, for: site)
-                            model.drafts[site] = nil
+                            let status = StreamKeychain.set(nil, for: site)
+                            model.keyError = status == errSecSuccess ? nil : "Couldn't remove the \(site.label) key from the keychain"
                             model.savedKeys[site] = StreamKeychain.hasKey(for: site)
                         }
                         .disabled(broadcaster.isLive)
@@ -96,6 +99,9 @@ struct StreamSettingsSection: View {
                 }
             }
         }
+        if let keyError = model.keyError {
+            Text(keyError).font(.callout).foregroundStyle(.yellow)
+        }
         if let notice = broadcaster.notice {
             Text(notice).font(.callout).foregroundStyle(.yellow)
         }
@@ -137,7 +143,12 @@ struct StreamSettingsSection: View {
 
     private func saveKey(_ site: StreamSite) {
         guard let key = model.drafts[site]?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else { return }
-        StreamKeychain.set(key, for: site)
+        // On failure the typed key stays in the field so it can be saved again.
+        guard StreamKeychain.set(key, for: site) == errSecSuccess else {
+            model.keyError = "Couldn't save the \(site.label) key in the keychain"
+            return
+        }
+        model.keyError = nil
         model.drafts[site] = nil
         model.savedKeys[site] = StreamKeychain.hasKey(for: site)
     }

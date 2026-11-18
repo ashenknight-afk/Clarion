@@ -53,11 +53,16 @@ enum StreamKeychain {
             || status == errSecInteractionRequired
     }
 
+    /// In the checks the account carries the process id, so two runs at once never share an item.
+    private static func account(_ site: StreamSite) -> String {
+        Bundle.main.bundleIdentifier == nil ? "\(site.rawValue).\(getpid())" : site.rawValue
+    }
+
     private static func baseQuery(_ site: StreamSite) -> [CFString: Any] {
         var query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
-            kSecAttrAccount: site.rawValue,
+            kSecAttrAccount: account(site),
         ]
         if Bundle.main.bundleIdentifier == nil {
             // The checks run unattended: fail instead of showing a keychain dialog.

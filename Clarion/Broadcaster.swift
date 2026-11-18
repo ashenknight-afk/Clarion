@@ -79,11 +79,12 @@ final class Broadcaster: ObservableObject {
     var onWantsFrames: ((Bool) -> Void)?
     /// Main thread: ask the source for its sound while live.
     var onWantsAudio: ((Bool) -> Void)?
-    /// Queue: the camera's newest picture, drawn in a corner when the config has a camera.
+    /// Queue: the camera's newest picture, drawn in a corner when the config has a camera. Set before `goLive`.
     var cameraFrame: (() -> CVPixelBuffer?)?
-    /// Checks only: each composed canvas before it is encoded, on the queue.
+    /// Checks only: each composed canvas before it is encoded, on the queue. Set before `goLive`.
     var onCanvas: ((CVPixelBuffer) -> Void)?
     /// Checks only: each mixed sound block (interleaved stereo, host time of its start) before it is encoded, on the queue.
+    /// Set before `goLive`.
     var onSoundBlock: (([Float], Double) -> Void)?
 
     private let queue = DispatchQueue(label: "clarion.broadcaster", qos: .userInitiated)
@@ -91,6 +92,8 @@ final class Broadcaster: ObservableObject {
 
     // main thread only
     private var ending = false
+    /// Completions of `end` calls made while an end was already running.
+    private var endCompletions: [() -> Void] = []
 
     // lock
     private let lock = NSLock()
@@ -139,7 +142,12 @@ final class Broadcaster: ObservableObject {
 
     /// Ends every site cleanly. `completion` runs on the main thread once all are closed.
     func end(completion: (() -> Void)? = nil) {
-        guard isLive, !ending else {
+        if ending {
+            // Quitting during an end must still wait for the sites to close.
+            if let completion { endCompletions.append(completion) }
+            return
+        }
+        guard isLive else {
             if let completion { DispatchQueue.main.async(execute: completion) }
             return
         }
@@ -156,7 +164,10 @@ final class Broadcaster: ObservableObject {
                 self.ending = false
                 for site in StreamSite.allCases where self.states[site] != .off { self.states[site] = .off }
                 self.startedAt = nil
+                let waiting = self.endCompletions
+                self.endCompletions = []
                 completion?()
+                waiting.forEach { $0() }
             }
         }
     }
