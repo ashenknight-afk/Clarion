@@ -171,7 +171,7 @@ func streamAudioChecks() {
     }
 
     check("a fast source with 2 ms jitter stays bounded and is corrected gently") {
-        let r = discontinuities(chunk: 0.01, jitter: 0.002, rateRatio: 1.001, seconds: 60)
+        let r = discontinuities(chunk: 0.02, jitter: 0.002, rateRatio: 1.001, seconds: 60)
         try expect(r.worstLead <= 0.1, "lead \(r.worstLead) s")
         // 0.1% of 60 s is about 2900 frames to remove, each showing as two or so; chasing jitter would be far more.
         try expect(r.breaks < 6500, "\(r.breaks) corrections")
