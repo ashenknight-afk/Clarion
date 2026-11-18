@@ -32,7 +32,7 @@ Needs: a Mac with macOS 14 (Sonoma) or newer. Best on Apple Silicon (M1 or newer
 
 4. KEYS
    Tab   settings
-   O     show / hide the stats
+   O     stats: off / compact / full
    U     sharper upscaling on / off
    S     sharpening on / off
    F     smooth 60 fps on / off (macOS 26 or newer; adds about 0.04 s of delay, so leave it off for fast games)

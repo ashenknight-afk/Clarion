@@ -211,8 +211,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
 
         // `receive(on:)` defers until the @Published value has actually changed.
-        settings.$showOverlay.map { _ in () }
+        settings.$statsMode.map { _ in () }
             .merge(with: ui.$showSettings.map { _ in () }, stats.$statusMessage.map { _ in () },
+                   settings.$latencyTest.map { _ in () },
                    recorder.$startedAt.map { _ in () }, recorder.$notice.map { _ in () })
             .receive(on: DispatchQueue.main)
             .sink { [weak self] in self?.updateOverlayVisibility() }
@@ -243,8 +244,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateOverlayVisibility() {
-        windowController?.overlayVisible = settings.showOverlay || ui.showSettings || stats.statusMessage != nil
-            || recorder.isRecording || recorder.notice != nil
+        windowController?.overlayVisible = settings.statsMode != .off || ui.showSettings || stats.statusMessage != nil
+            || recorder.isRecording || recorder.notice != nil || settings.latencyTest
     }
 
     // MARK: - Hotkeys
@@ -274,7 +275,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let key = event.charactersIgnoringModifiers?.lowercased()
         if event.isARepeat { return key.map { "omusfalprv".contains($0) } ?? false }
         switch key {
-        case "o": settings.showOverlay.toggle()
+        case "o": settings.statsMode = settings.statsMode.next
         case "m": settings.scalingMode = settings.scalingMode.next
         case "u": settings.upscalingEnabled.toggle()
         case "s": settings.sharpeningEnabled.toggle()

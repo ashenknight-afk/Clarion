@@ -9,6 +9,8 @@ struct OverlayLine: Identifiable, Equatable {
 /// Text the overlay shows, rebuilt from the renderer's counters a couple of times a second.
 final class StatsModel: ObservableObject {
     @Published private(set) var lines: [OverlayLine] = []
+    /// The few numbers worth watching while playing.
+    @Published private(set) var compactLines: [OverlayLine] = []
     @Published private(set) var statusMessage: String?
 
     func update(render: RenderStats, state: CaptureState, captureSummary: String, display: DisplayInfo?,
@@ -37,8 +39,11 @@ final class StatsModel: ObservableObject {
         lines.append(OverlayLine(label: "SCALE", value: receiving ? render.scaler : "—"))
         lines.append(OverlayLine(label: "SHARP", value: settings.sharpeningEnabled
                                  ? String(format: "CAS %.0f%%", settings.effectiveSharpness * 100) : "off"))
+        let frameGeneration = render.frameGeneration ?? "On"
         if settings.frameGenerationEnabled {
-            lines.append(OverlayLine(label: "FGEN", value: (render.frameGeneration ?? "On") + " · adds latency"))
+            // Idle or unavailable, it adds nothing.
+            lines.append(OverlayLine(label: "FGEN", value: frameGeneration.hasPrefix("On")
+                                     ? frameGeneration + " · adds latency" : frameGeneration))
         }
         lines.append(OverlayLine(label: "AUDIO", value: window ? "from the streaming app" : Self.describe(audio)))
         lines.append(OverlayLine(label: "DISP", value: display?.summary ?? "—"))
@@ -47,6 +52,19 @@ final class StatsModel: ObservableObject {
             lines.append(OverlayLine(label: "TEST", value: "Latency test · \(render.latencyFlashes) flashes"))
         }
         if self.lines != lines { self.lines = lines }
+
+        var compact: [OverlayLine] = []
+        if receiving {
+            compact.append(OverlayLine(label: "IN", value: String(format: "%.0f fps", render.inputFPS)))
+            compact.append(OverlayLine(label: "OUT", value: String(format: "%.0f fps", render.outputFPS)))
+            compact.append(OverlayLine(label: "LAT", value: render.latencyMs > 0 ? String(format: "%.0f ms", render.latencyMs) : "—"))
+        } else {
+            compact.append(OverlayLine(label: "IN", value: "no frames"))
+        }
+        if settings.frameGenerationEnabled {
+            compact.append(OverlayLine(label: "FGEN", value: frameGeneration))
+        }
+        if compactLines != compact { compactLines = compact }
 
         let message: String?
         if window {
@@ -98,10 +116,11 @@ final class StatsModel: ObservableObject {
 
 struct StatsOverlay: View {
     @ObservedObject var stats: StatsModel
+    let compact: Bool
 
     var body: some View {
         Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 3) {
-            ForEach(stats.lines) { line in
+            ForEach(compact ? stats.compactLines : stats.lines) { line in
                 GridRow {
                     Text(line.label).foregroundStyle(.white.opacity(0.55))
                     Text(line.value).foregroundStyle(.white)
@@ -154,21 +173,20 @@ struct RecorderBadge: View {
             }
         }
     }
+}
 
-    private struct BadgeStyle: ViewModifier {
-        func body(content: Content) -> some View {
-            content
-                .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                .background(.black.opacity(0.62), in: Capsule())
-        }
+private struct BadgeStyle: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .font(.system(size: 13, weight: .semibold, design: .monospaced))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(.black.opacity(0.62), in: Capsule())
     }
 }
 
-/// Everything drawn over the video: stats (top-left), recording badge (top), status (center),
-/// settings (right).
+/// Everything drawn over the video: stats (top-left), badges (top), status (center), settings (right).
 struct VideoOverlayRoot: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject var ui: UIState
@@ -186,15 +204,21 @@ struct VideoOverlayRoot: View {
             if let message = stats.statusMessage {
                 StatusBanner(message: message)
             }
-            if settings.showOverlay {
-                StatsOverlay(stats: stats)
+            if settings.statsMode != .off {
+                StatsOverlay(stats: stats, compact: settings.statsMode == .compact)
                     .padding(24)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
-            if recorder.isRecording || recorder.notice != nil {
-                RecorderBadge(recorder: recorder)
-                    .padding(24)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            if recorder.isRecording || recorder.notice != nil || settings.latencyTest {
+                VStack(spacing: 8) {
+                    if settings.latencyTest {
+                        // The test's square is part of the picture, so say that it is on.
+                        Text("LATENCY TEST · L to stop").modifier(BadgeStyle())
+                    }
+                    RecorderBadge(recorder: recorder)
+                }
+                .padding(24)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
             if ui.showSettings {
                 SettingsView(settings: settings, recorder: recorder, capture: capture, windowCapture: windowCapture, audio: audio, displays: displays,

@@ -32,7 +32,7 @@ struct SettingsView: View {
             .padding(.top, 16)
 
             Form {
-                Section("Source") {
+                Section {
                     Picker("Source", selection: $settings.source) {
                         ForEach(VideoSource.allCases) { source in
                             Text(source.label).tag(source)
@@ -41,82 +41,134 @@ struct SettingsView: View {
                     .pickerStyle(.segmented)
                     .labelsHidden()
                 }
-                if settings.source == .captureCard {
-                    captureSection
-                } else {
-                    windowSection
-                }
-                outputSection
+                pictureSection
                 enhancementSection
                 if settings.source == .captureCard {
                     audioSection
                 }
                 recordingSection
-                Section("Overlay & testing") {
-                    Toggle("Show stats overlay", isOn: $settings.showOverlay)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Toggle("Latency test", isOn: $settings.latencyTest)
-                        Text("A square in the video's corner turns white whenever the centre of the picture is bright. Film the screen in slow motion to time it.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                }
+                overlaySection
                 shortcutsSection
             }
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
+
+            Divider()
+            HStack {
+                Text("Tab shows and hides this panel").font(.callout).foregroundStyle(.secondary)
+                Spacer()
+                Button("Quit Clarion") { NSApp.terminate(nil) }
+                    .help("Quit (⌘Q)")
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
         }
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .environment(\.colorScheme, .dark)
     }
 
-    private var captureSection: some View {
-        Section("Capture") {
-            if capture.state == .denied {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Clarion needs camera access to read your capture card.")
-                    Button("Open Privacy Settings…") {
-                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera")!)
-                    }
+    // MARK: - Picture
+
+    /// Where the picture comes from, then where and how it is shown.
+    private var pictureSection: some View {
+        Section("Picture") {
+            if settings.source == .captureCard {
+                captureRows
+            } else {
+                windowRows
+            }
+
+            Picker("Display", selection: $settings.displayID) {
+                Text("Automatic").tag(UInt32(0))
+                ForEach(displays.displays) { display in
+                    Text(display.summary).tag(display.id)
                 }
             }
 
-            Picker("Device", selection: $settings.deviceID) {
-                if settings.deviceID == nil || !capture.devices.contains(where: { $0.id == settings.deviceID }) {
-                    Text(settings.deviceID != nil ? "Saved device (unplugged)"
-                         : capture.devices.isEmpty ? "None connected" : "Automatic")
-                        .tag(settings.deviceID)
-                }
-                ForEach(capture.devices) { device in
-                    Text(device.name).tag(Optional(device.id))
+            Picker("Scaling", selection: $settings.scalingMode) {
+                ForEach(ScalingMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
                 }
             }
+            .pickerStyle(.segmented)
 
-            Picker("Format", selection: $settings.formatID) {
-                if selectedFormat == nil {
-                    Text("Default").tag(settings.formatID)
-                }
-                ForEach(capture.formats) { format in
-                    Text(format.label).tag(Optional(format.id))
+            noted("Off lowers the delay. On some Macs it can tear.") {
+                Toggle("V-Sync", isOn: $settings.displaySyncEnabled)
+            }
+        }
+    }
+
+    @ViewBuilder private var captureRows: some View {
+        if capture.state == .denied {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Clarion needs camera access to read your capture card.")
+                Button("Open Privacy Settings…") {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera")!)
                 }
             }
+        }
 
+        Picker("Device", selection: $settings.deviceID) {
+            if settings.deviceID == nil || !capture.devices.contains(where: { $0.id == settings.deviceID }) {
+                Text(settings.deviceID != nil ? "Saved device (unplugged)"
+                     : capture.devices.isEmpty ? "None connected" : "Automatic")
+                    .tag(settings.deviceID)
+            }
+            ForEach(capture.devices) { device in
+                Text(device.name).tag(Optional(device.id))
+            }
+        }
+
+        formatRow
+
+        // One rate to choose from is no choice.
+        if let rates = selectedFormat?.frameRates, rates.count > 1 {
             Picker("Frame rate", selection: $settings.frameRate) {
                 Text("Highest").tag(0.0)
-                ForEach(selectedFormat?.frameRates ?? [], id: \.self) { fps in
+                ForEach(rates, id: \.self) { fps in
                     Text("\(formatFPS(fps)) fps").tag(fps)
                 }
             }
+        }
 
-            if selectedFormat?.isCompressed == true {
-                Label("MJPEG is decoded before display and adds latency. Use 420v or YUY2 if your card offers it.",
-                      systemImage: "exclamationmark.triangle")
-                    .font(.callout)
-                    .foregroundStyle(.yellow)
+        if selectedFormat?.isCompressed == true {
+            Label("MJPEG is decoded before display and adds delay. Use YUY2 or 420v if your card offers it.",
+                  systemImage: "exclamationmark.triangle")
+                .font(.callout)
+                .foregroundStyle(.yellow)
+        }
+    }
+
+    /// The sizes a console is normally captured at, with everything else the card offers one level down.
+    private var formatRow: some View {
+        let common = capture.formats.filter(\.isCommon)
+        let shown = common.isEmpty ? capture.formats : common
+        let other = common.isEmpty ? [] : capture.formats.filter { !$0.isCommon }
+        let recommended = CaptureManager.defaultFormat(in: capture.formats)?.id
+        return LabeledContent("Format") {
+            Menu {
+                formatButtons(shown, recommended: recommended)
+                if !other.isEmpty {
+                    Menu("Other sizes") { formatButtons(other, recommended: recommended) }
+                }
+            } label: {
+                Text(selectedFormat?.label ?? (capture.formats.isEmpty ? "None" : "Automatic"))
             }
+            .fixedSize()
+        }
+    }
 
-            if !capture.activeSummary.isEmpty {
-                Text(capture.activeSummary).font(.callout).foregroundStyle(.secondary)
+    private func formatButtons(_ formats: [CaptureFormatOption], recommended: String?) -> some View {
+        ForEach(formats) { format in
+            let title = format.label + (format.id == recommended ? " · recommended" : "")
+            Button {
+                settings.formatID = format.id
+            } label: {
+                if format.id == settings.formatID {
+                    Label(title, systemImage: "checkmark")
+                } else {
+                    Text(title)
+                }
             }
         }
     }
@@ -133,17 +185,17 @@ struct SettingsView: View {
         )
     }
 
-    private var windowSection: some View {
-        Section("Window") {
-            if windowCapture.state == .denied {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Clarion needs Screen Recording access to read another app's window. Turn it on, then relaunch Clarion.")
-                    Button("Open Screen Recording Settings…") {
-                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
-                    }
+    @ViewBuilder private var windowRows: some View {
+        if windowCapture.state == .denied {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Clarion needs Screen Recording access to read another app's window. Turn it on, then relaunch Clarion.")
+                Button("Open Screen Recording Settings…") {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
                 }
             }
+        }
 
+        noted("Keep the streaming app open; it can sit behind Clarion.") {
             HStack {
                 Picker("Window", selection: windowChoice) {
                     Text("Automatic (find Remote Play)").tag(String?.none)
@@ -163,48 +215,19 @@ struct SettingsView: View {
                 .buttonStyle(.borderless)
                 .help("Refresh the window list")
             }
-
-            Toggle("Hide the window's title bar", isOn: $settings.windowHideTitleBar)
-
-            Text("Keep the streaming app open; it can sit behind Clarion. Window capture adds about one frame of latency on top of the stream's own delay.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-
-            if !windowCapture.activeSummary.isEmpty {
-                Text(windowCapture.activeSummary).font(.callout).foregroundStyle(.secondary)
-            }
         }
         .onAppear { windowCapture.refresh() }
+
+        Toggle("Hide the window's title bar", isOn: $settings.windowHideTitleBar)
     }
 
-    private var outputSection: some View {
-        Section("Output") {
-            Picker("Display", selection: $settings.displayID) {
-                Text("Automatic").tag(UInt32(0))
-                ForEach(displays.displays) { display in
-                    Text(display.summary).tag(display.id)
-                }
-            }
-
-            Picker("Scaling", selection: $settings.scalingMode) {
-                ForEach(ScalingMode.allCases) { mode in
-                    Text(mode.label).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-
-            VStack(alignment: .leading, spacing: 4) {
-                Toggle("V-Sync", isOn: $settings.displaySyncEnabled)
-                Text("Off gives the lowest latency but can tear.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
+    // MARK: - Enhance
 
     private var enhancementSection: some View {
-        Section("Enhancement") {
-            Toggle("Upscaling", isOn: $settings.upscalingEnabled)
+        Section("Enhance") {
+            noted("Used when the screen is larger than the picture. Adds GPU time, not frames of delay.") {
+                Toggle("Upscaling", isOn: $settings.upscalingEnabled)
+            }
             if settings.upscalingEnabled {
                 if supportsMetalFX {
                     Picker("Method", selection: $settings.upscaler) {
@@ -216,9 +239,6 @@ struct SettingsView: View {
                 } else {
                     LabeledContent("Method", value: "Lanczos")
                 }
-                Text("Runs only when the screen is bigger than the capture, e.g. 1080p on a 4K TV. Adds GPU time, not frames of delay.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
             }
 
             Toggle("Sharpening", isOn: $settings.sharpeningEnabled)
@@ -234,36 +254,33 @@ struct SettingsView: View {
             }
 
             if supportsFrameGeneration {
-                VStack(alignment: .leading, spacing: 4) {
+                noted("For 30 fps games. Adds about 30 ms of delay; turn it off for tight timing.") {
                     Toggle("Frame generation (30 → 60 fps)", isOn: $settings.frameGenerationEnabled)
-                    if settings.frameGenerationEnabled {
-                        Picker("Generated frames", selection: $settings.frameGenerationFast) {
+                }
+                if settings.frameGenerationEnabled {
+                    noted("Fast is about 10 ms quicker. Whatever holds still, such as the HUD, stays sharp in both.") {
+                        Picker("In-between frames", selection: $settings.frameGenerationFast) {
                             Text("Fast (720p)").tag(true)
                             Text("Full (1080p)").tag(false)
                         }
                         .pickerStyle(.segmented)
-                        Text("Fast makes the in-between frames at 720p: about 10 ms less delay. Real frames, and anything that holds still such as the HUD, stay full resolution.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                        if settings.source == .window {
+                    }
+                    // A capture card delivers no late frames to cover for.
+                    if settings.source == .window {
+                        noted("Keeps one frame ready for when the stream delivers late: fewer small hitches, up to 17 ms more delay on a 60 Hz screen.") {
                             Toggle("Steadier motion", isOn: $settings.frameGenerationSteady)
-                            Text("Streams deliver some frames late. On: one frame waits ready to cover for them, which can add about 17 ms on a 60 Hz screen. Off: lowest delay, with a few more small hitches a second.")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
                         }
                     }
-                    Label("Adds latency: each real frame waits half a frame (about 17 ms at 30 fps) plus processing, so an in-between frame can be shown first. Best for exploring; turn it off for tight timing.",
-                          systemImage: "exclamationmark.triangle")
-                        .font(.callout)
-                        .foregroundStyle(settings.frameGenerationEnabled ? .yellow : .secondary)
                 }
             }
         }
     }
 
+    // MARK: - Sound, recording, overlay
+
     private var audioSection: some View {
-        Section("Audio") {
-            Toggle("Play capture card audio", isOn: $settings.audioEnabled)
+        Section("Sound") {
+            Toggle("Play the capture card's sound", isOn: $settings.audioEnabled)
             if settings.audioEnabled {
                 Picker("Input", selection: $settings.audioDeviceID) {
                     Text("Match capture device").tag(String?.none)
@@ -293,37 +310,57 @@ struct SettingsView: View {
 
     private var recordingSection: some View {
         Section("Screenshots & recording") {
-            HStack {
-                Button("Take screenshot") { recorder.takeScreenshot() }
-                Spacer()
-                Button(recorder.isRecording ? "Stop recording" : "Start recording") { recorder.toggleRecording() }
+            noted("Saves the enhanced picture: screenshots to Pictures → Clarion, recordings with sound to Movies → Clarion.") {
+                HStack {
+                    Button("Take screenshot") { recorder.takeScreenshot() }
+                    Button(recorder.isRecording ? "Stop recording" : "Start recording") { recorder.toggleRecording() }
+                    Spacer()
+                    Button {
+                        if let folder = Recorder.folder(.moviesDirectory) { NSWorkspace.shared.open(folder) }
+                    } label: {
+                        Image(systemName: "folder")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Show recordings in Finder")
+                }
             }
             Toggle("Include the stats", isOn: $settings.recordStats)
-            Text("Saves the enhanced picture. Screenshots go to Pictures → Clarion, recordings (with the game's sound) to Movies → Clarion.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Button("Show recordings in Finder") {
-                if let folder = Recorder.folder(.moviesDirectory) { NSWorkspace.shared.open(folder) }
+        }
+    }
+
+    private var overlaySection: some View {
+        Section("Overlay & testing") {
+            Picker("Stats", selection: $settings.statsMode) {
+                ForEach(StatsMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            noted("A square in the video's corner turns white while the centre of the picture is bright. Film the screen in slow motion to time it. Turns itself off after \(Int(AppSettings.latencyTestDuration / 60)) minutes.") {
+                Toggle("Latency test", isOn: $settings.latencyTest)
             }
         }
     }
 
     private var shortcutsSection: some View {
-        Section("Shortcuts") {
-            shortcut("Tab  or  ⌘,", "Show / hide settings")
-            shortcut("O", "Stats overlay")
-            shortcut("M", "Cycle Fit / Fill / Stretch")
-            shortcut("V", "V-Sync on / off")
-            shortcut("U", "Upscaling on / off")
-            shortcut("S", "Sharpening on / off")
-            if supportsFrameGeneration {
-                shortcut("F", "Frame generation on / off")
+        Section {
+            DisclosureGroup("Shortcuts") {
+                shortcut("Tab  or  ⌘,", "Show / hide settings")
+                shortcut("O", "Stats: off / compact / full")
+                shortcut("M", "Cycle Fit / Fill / Stretch")
+                shortcut("V", "V-Sync on / off")
+                shortcut("U", "Upscaling on / off")
+                shortcut("S", "Sharpening on / off")
+                if supportsFrameGeneration {
+                    shortcut("F", "Frame generation on / off")
+                }
+                shortcut("A", "Sound on / off")
+                shortcut("P", "Take a screenshot")
+                shortcut("R", "Start / stop recording")
+                shortcut("L", "Latency test on / off")
+                shortcut("⌘Q", "Quit")
             }
-            shortcut("A", "Audio on / off")
-            shortcut("P", "Take a screenshot")
-            shortcut("R", "Start / stop recording")
-            shortcut("L", "Latency test on / off")
-            shortcut("⌘Q", "Quit")
         }
     }
 
@@ -332,6 +369,17 @@ struct SettingsView: View {
             Text(keys).font(.system(.body, design: .monospaced))
             Spacer()
             Text(action).foregroundStyle(.secondary)
+        }
+    }
+
+    /// A control with one line of explanation under it, kept together as a single row.
+    private func noted<Content: View>(_ note: String, @ViewBuilder _ content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            content()
+            Text(note)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }

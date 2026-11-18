@@ -20,8 +20,14 @@ struct CaptureFormatOption: Identifiable, Hashable {
     var isCompressed: Bool { !CaptureManager.uncompressedSubtypes.contains(subtype) }
 
     var label: String {
-        let fps = frameRates.first.map { " · up to \(formatFPS($0)) fps" } ?? ""
-        return "\(width)×\(height) · \(subtype.formatName)\(fps)"
+        let fps = frameRates.first.map { " · \(formatFPS($0)) fps" } ?? ""
+        let format = subtype.formatName.split(separator: " ").first.map(String.init) ?? subtype.formatName
+        return "\(width)×\(height) · \(format)\(fps)"
+    }
+
+    /// 16:9 at 720p or more, uncompressed: the sizes a console is normally captured at.
+    var isCommon: Bool {
+        !isCompressed && height >= 720 && width * 9 == height * 16
     }
 }
 
@@ -352,15 +358,17 @@ final class CaptureManager: NSObject, ObservableObject {
 
     private static func subtypeRank(_ subtype: FourCharCode) -> Int {
         switch subtype {
-        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: return 0
-        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: return 1
-        case kCVPixelFormatType_422YpCbCr8_yuvs: return 2
-        case kCVPixelFormatType_422YpCbCr8: return 3
+        // 4:2:2 first: it is what capture cards send natively. An MS2130 delivered YUY2 about 6 ms
+        // sooner than 420v, and frame generation dropped frames on its 420v.
+        case kCVPixelFormatType_422YpCbCr8_yuvs: return 0
+        case kCVPixelFormatType_422YpCbCr8: return 1
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: return 2
+        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: return 3
         default: return 4
         }
     }
 
-    /// 1920×1080 uncompressed (420v first) at its highest rate; otherwise the largest uncompressed
+    /// 1920×1080 uncompressed (YUY2 first) at its highest rate; otherwise the largest uncompressed
     /// format. MJPEG only if the device has nothing else.
     static func defaultFormat(in options: [CaptureFormatOption]) -> CaptureFormatOption? {
         let uncompressed = options.filter { !$0.isCompressed }

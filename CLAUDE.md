@@ -10,7 +10,7 @@ dependencies, no drivers, sandboxed. macOS 14+, Apple Silicon first, Intel must 
 - `Config/` holds Info.plist and entitlements. It is referenced only by build settings, so it is not compiled.
 
 ## Latency rules (do not regress)
-- Capture uncompressed (420v, then YUY2/UYVY). MJPEG only when the user picks it.
+- Capture uncompressed (YUY2/UYVY, then 420v: see the MS2130 numbers below). MJPEG only when the user picks it.
 - `alwaysDiscardsLateVideoFrames = true`; frames are handled on a dedicated `.userInteractive` serial queue.
 - Zero copy: CVPixelBuffer → CVMetalTextureCache → MTLTexture. No CPU copies, no CIImage.
 - Max 1 frame in flight; CAMetalLayer `maximumDrawableCount = 2`, `framebufferOnly = true`. The capture thread never

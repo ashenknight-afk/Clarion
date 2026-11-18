@@ -61,7 +61,7 @@ streaming app.
 | Key | Does |
 |---|---|
 | Tab or ⌘, | Settings |
-| O | Stats overlay |
+| O | Stats: off, compact, full |
 | M | Fit / Fill / Stretch |
 | V | V-Sync (off is fastest and can tear) |
 | U | Upscaling |

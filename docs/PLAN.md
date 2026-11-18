@@ -6,7 +6,7 @@ picture. First goal: under 100 ms glass to glass. Second: a sharper image.
 ## Frame path
 
 ```
-capture card ─▶ AVCaptureVideoDataOutput (420v / YUY2 / UYVY, late frames discarded)
+capture card ─▶ AVCaptureVideoDataOutput (YUY2 / UYVY / 420v, late frames discarded)
 streaming app ─▶ ScreenCaptureKit window capture (420v, 16:9 crop of the window)
         ─▶ CVMetalTextureCache (zero copy, IOSurface-backed)
         ─▶ [frame generation: 420v copy → VTFrameProcessor → still-pixel lock]
