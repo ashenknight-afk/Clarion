@@ -513,6 +513,37 @@ func broadcasterChecks() {
         try expect((video.last?.timestamp ?? 0) < 3000, "new connection's clock didn't start at 0: \(video.last?.timestamp ?? 0)")
     }
 
+    check("an error status while publishing reconnects instead of failing") {
+        let server = try RTMPTestServer(behaviour: .errorAfterPublish)
+        defer { server.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        broadcaster.timeScale = 0.01
+        let log = StateLog(broadcaster, site: .twitch)
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(oneSite(port: server.port, key: "abc"))
+        let failed = { log.states.contains { if case .failed = $0 { return true } else { return false } } }
+        try expect(spin(timeout: 5) { log.states.contains(.reconnecting(1)) || failed() }, "states \(log.states)")
+        try expect(!failed() && log.states.contains(.reconnecting(1)), "states \(log.states)")
+        try expect(spin(timeout: 5) { server.connectionCount >= 2 }, "no second connection")
+        try ends(broadcaster)
+    }
+
+    check("sites that can't start end the stream with a notice") {
+        let broadcaster = Broadcaster(device: device, library: library)
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(StreamConfig(sites: [StreamSiteConfig(site: .twitch, server: "http://127.0.0.1/live", key: "abc",
+                                                                 quality: .p1080, bitrate: 0)],
+                                        gameVolume: 1, camera: nil, mic: nil))
+        try expect(spin(timeout: 5) { broadcaster.notice != nil }, "no notice; states \(broadcaster.states)")
+        try expect(broadcaster.notice == "The stream ended. Twitch: Check the server address in Settings",
+                   "notice \(broadcaster.notice ?? "nil")")
+        try expect(!broadcaster.isLive, "still live")
+    }
+
     check("a refused publish fails at once, without reconnecting") {
         let server = try RTMPTestServer(behaviour: .rejectPublish(description: "bad key"))
         defer { server.stop() }
@@ -544,8 +575,6 @@ func broadcasterChecks() {
         broadcaster.goLive(oneSite(port: server.port, key: "abc"))
         try expect(spin(timeout: 15) { broadcaster.states[.twitch] == .failed("Connection lost") }, "states \(log.states)")
         try expect(log.states.contains(.reconnecting(5)) && !log.states.contains(.reconnecting(6)), "states \(log.states)")
-        // The notice comes in the main-thread update after the state.
-        spin(timeout: 1) { broadcaster.notice != nil }
         try expect(!broadcaster.isLive, "still live")
         try expect(broadcaster.notice?.contains("Connection lost") == true, "notice \(broadcaster.notice ?? "nil")")
     }

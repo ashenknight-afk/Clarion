@@ -348,10 +348,12 @@ final class Broadcaster: ObservableObject {
     }
 
     /// Ends the session from the queue, with `text` (if any) as the notice. Sites already failed keep their state.
-    private func giveUp(_ text: String?) {
+    /// `failed` is set in the same main-thread update as the notice.
+    private func giveUp(_ text: String?, failed: (site: StreamSite, text: String)? = nil) {
         for site in stopSession() { site.close {} }
         DispatchQueue.main.async {
             if !self.ending { self.stopTakingInput() }
+            if let failed { self.states[failed.site] = .failed(failed.text) }
             if let text { self.notice = text }
             for (site, state) in self.states {
                 switch state {
@@ -450,6 +452,8 @@ final class Broadcaster: ObservableObject {
         sitesStarted = true
         let session = self.session
         var anyEncodable = false
+        /// The last site that couldn't start and why, for the notice when none could.
+        var lastFailure: String?
         for siteConfig in config.sites {
             let site = siteConfig.site
             guard let quality = StreamQuality.choose(wanted: siteConfig.quality, frameHeight: frameHeight,
@@ -464,13 +468,16 @@ final class Broadcaster: ObservableObject {
                 broadcastSite = try BroadcastSite(config: siteConfig, quality: quality, bitrate: bitrate, queue: queue,
                                                   timeScale: timeScaleInUse)
             } catch {
-                publish(.failed((error as? BroadcastSite.StartError)?.text ?? "Couldn't start"), for: site)
+                let text = (error as? BroadcastSite.StartError)?.text ?? "Couldn't start"
+                publish(.failed(text), for: site)
+                lastFailure = "\(site.label): \(text)"
                 continue
             }
             let key = EncoderKey(broadcastSite)
             if encoders[key] == nil {
                 guard let shared = makeEncoder(key) else {
                     publish(.failed("Couldn't start the video encoder"), for: site)
+                    lastFailure = "\(site.label): Couldn't start the video encoder"
                     continue
                 }
                 encoders[key] = shared
@@ -488,7 +495,7 @@ final class Broadcaster: ObservableObject {
         updateInfo(now: CACurrentMediaTime())
         nextInfo = CACurrentMediaTime() + 1
         if !anyEncodable { return giveUp("Streaming isn't available on this Mac") }
-        if sites.isEmpty { return giveUp(nil) }
+        if sites.isEmpty { return giveUp(lastFailure.map { "The stream ended. \($0)" }) }
         // Started once all are set up, so a site that fails at once can't end the others' session early.
         for site in sites.values { site.start() }
     }
@@ -529,8 +536,11 @@ final class Broadcaster: ObservableObject {
             publish(.reconnecting(attempt), for: site)
         case .failed(let text):
             remove(site)
-            publish(.failed(text), for: site)
-            if sites.isEmpty { giveUp("The stream ended. \(site.label): \(text)") }
+            if sites.isEmpty {
+                giveUp("The stream ended. \(site.label): \(text)", failed: (site, text))
+            } else {
+                publish(.failed(text), for: site)
+            }
         case .closed:
             remove(site)
             publish(.off, for: site)

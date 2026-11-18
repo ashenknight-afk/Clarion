@@ -78,7 +78,8 @@ final class RTMPConnection {
     var droppedVideoFrames: Int { sendQueue.droppedVideoFrames }
     /// True while the network is too slow and video is being thrown away.
     var isDropping: Bool { sendQueue.isDropping }
-    /// The failure was the server saying no (`_error`, a refused publish), not the network.
+    /// The failure was the server saying no (`_error`, a refused publish) before publishing, not the network.
+    /// An error status once publishing is a lost stream, which may come back.
     private(set) var refusedByServer = false
 
     private let target: Target
@@ -219,7 +220,7 @@ final class RTMPConnection {
 
     private func refuse(_ text: String) {
         guard !isFinished else { return }
-        refusedByServer = true
+        refusedByServer = state != .publishing
         fail(text)
     }
 

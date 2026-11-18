@@ -14,6 +14,8 @@ final class RTMPTestServer {
         case garbleConnectAnswer
         /// Accepts the publish, then stops reading, like a dead network.
         case stallAfterPublish
+        /// Accepts the publish, then sends an error status and closes, every time.
+        case errorAfterPublish
     }
 
     struct StartError: Error, CustomStringConvertible { let description: String }
@@ -187,6 +189,12 @@ final class RTMPTestServer {
             case .stallAfterPublish:
                 drops = false
                 peer.stalled = true
+            case .errorAfterPublish:
+                send(onStatus("status", "NetStream.Publish.Start", "Publishing."), to: peer, streamID: 1)
+                send(onStatus("error", "NetStream.Failed", "Ingest restarting."), to: peer, streamID: 1) {
+                    peer.connection.cancel()
+                }
+                return
             case .accept, .silent, .garbleConnectAnswer: drops = false
             }
             send(onStatus("status", "NetStream.Publish.Start", "Publishing."), to: peer, streamID: 1) { [weak self] in
