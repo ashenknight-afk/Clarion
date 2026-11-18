@@ -10,6 +10,7 @@ SOURCES=(
   Clarion/RTMPChunk.swift
   Clarion/RTMPConnection.swift
   Clarion/StreamVideoEncoder.swift
+  Clarion/StreamAudio.swift
 )
 
 mkdir -p build
