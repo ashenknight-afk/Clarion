@@ -4,6 +4,7 @@ import AppKit
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject var recorder: Recorder
+    let broadcaster: Broadcaster
     @ObservedObject var capture: CaptureManager
     @ObservedObject var windowCapture: WindowCaptureManager
     @ObservedObject var audio: AudioPassthrough
@@ -52,6 +53,7 @@ struct SettingsView: View {
                     audioSection
                 }
                 recordingSection
+                StreamSettingsSection(settings: settings, broadcaster: broadcaster)
                 Section("Overlay & testing") {
                     Toggle("Show stats overlay", isOn: $settings.showOverlay)
                     VStack(alignment: .leading, spacing: 4) {

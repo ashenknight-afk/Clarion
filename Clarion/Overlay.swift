@@ -174,6 +174,7 @@ struct VideoOverlayRoot: View {
     @ObservedObject var ui: UIState
     @ObservedObject var stats: StatsModel
     @ObservedObject var recorder: Recorder
+    let broadcaster: Broadcaster
     let capture: CaptureManager
     let windowCapture: WindowCaptureManager
     let audio: AudioPassthrough
@@ -197,7 +198,7 @@ struct VideoOverlayRoot: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
             if ui.showSettings {
-                SettingsView(settings: settings, recorder: recorder, capture: capture, windowCapture: windowCapture, audio: audio, displays: displays,
+                SettingsView(settings: settings, recorder: recorder, broadcaster: broadcaster, capture: capture, windowCapture: windowCapture, audio: audio, displays: displays,
                              supportsMetalFX: supportsMetalFX, supportsFrameGeneration: supportsFrameGeneration) {
                     ui.showSettings = false
                 }

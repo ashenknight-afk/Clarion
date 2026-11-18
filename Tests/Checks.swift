@@ -33,6 +33,7 @@ private let checkGroups: [() -> Void] = [
     videoEncoderChecks,
     streamAudioChecks,
     compositorChecks,
+    broadcasterChecks,
 ]
 
 @main

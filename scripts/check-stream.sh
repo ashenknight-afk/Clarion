@@ -12,9 +12,13 @@ SOURCES=(
   Clarion/StreamVideoEncoder.swift
   Clarion/StreamAudio.swift
   Clarion/StreamCompositor.swift
+  Clarion/Recorder.swift
+  Clarion/StreamKeychain.swift
+  Clarion/BroadcastSite.swift
+  Clarion/Broadcaster.swift
 )
 
 mkdir -p build
-swiftc -swift-version 5 -parse-as-library -sdk "$(xcrun --show-sdk-path)" \
+swiftc -swift-version 5 -parse-as-library -sdk "$(xcrun --show-sdk-path)" -target "$(uname -m)-apple-macos14.0" \
   "${SOURCES[@]}" Tests/*.swift -o build/stream-checks
 build/stream-checks "$PWD"

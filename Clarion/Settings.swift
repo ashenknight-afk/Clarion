@@ -59,6 +59,11 @@ final class AppSettings: ObservableObject {
         static let audioEnabled = "audio.enabled"
         static let audioDeviceID = "audio.deviceID"
         static let audioVolume = "audio.volume"
+        static func streamEnabled(_ site: StreamSite) -> String { "stream.\(site.rawValue).enabled" }
+        static func streamServer(_ site: StreamSite) -> String { "stream.\(site.rawValue).server" }
+        static func streamBitrate(_ site: StreamSite) -> String { "stream.\(site.rawValue).bitrate" }
+        static let streamYouTubeQuality = "stream.youtube.quality"
+        static let streamGameVolume = "stream.gameVolume"
     }
 
     private let defaults: UserDefaults
@@ -101,6 +106,23 @@ final class AppSettings: ObservableObject {
     @Published var audioDeviceID: String? { didSet { defaults.set(audioDeviceID, forKey: Key.audioDeviceID) } }
     /// 0…1.
     @Published var audioVolume: Double { didSet { defaults.set(audioVolume, forKey: Key.audioVolume) } }
+    /// Stream keys are not settings: they live in the keychain (`StreamKeychain`).
+    @Published var streamEnabled: [StreamSite: Bool] {
+        didSet { StreamSite.allCases.forEach { defaults.set(streamEnabled[$0] ?? false, forKey: Key.streamEnabled($0)) } }
+    }
+    /// Empty = the site's default server.
+    @Published var streamServer: [StreamSite: String] {
+        didSet { StreamSite.allCases.forEach { defaults.set(streamServer[$0] ?? "", forKey: Key.streamServer($0)) } }
+    }
+    /// Bits per second; 0 = the site's default for the canvas.
+    @Published var streamBitrate: [StreamSite: Int] {
+        didSet { StreamSite.allCases.forEach { defaults.set(streamBitrate[$0] ?? 0, forKey: Key.streamBitrate($0)) } }
+    }
+    @Published var streamYouTubeQuality: StreamQuality {
+        didSet { defaults.set(streamYouTubeQuality.rawValue, forKey: Key.streamYouTubeQuality) }
+    }
+    /// 0…1.
+    @Published var streamGameVolume: Double { didSet { defaults.set(streamGameVolume, forKey: Key.streamGameVolume) } }
     /// A measuring aid, so it always starts off.
     @Published var latencyTest = false
 
@@ -149,5 +171,22 @@ final class AppSettings: ObservableObject {
         audioEnabled = defaults.object(forKey: Key.audioEnabled) as? Bool ?? true
         audioDeviceID = defaults.string(forKey: Key.audioDeviceID)
         audioVolume = defaults.object(forKey: Key.audioVolume) as? Double ?? 1
+        streamEnabled = Dictionary(uniqueKeysWithValues: StreamSite.allCases.map { ($0, defaults.bool(forKey: Key.streamEnabled($0))) })
+        streamServer = Dictionary(uniqueKeysWithValues: StreamSite.allCases.map { ($0, defaults.string(forKey: Key.streamServer($0)) ?? "") })
+        streamBitrate = Dictionary(uniqueKeysWithValues: StreamSite.allCases.map { ($0, max(0, defaults.integer(forKey: Key.streamBitrate($0)))) })
+        streamYouTubeQuality = StreamQuality(rawValue: defaults.object(forKey: Key.streamYouTubeQuality) as? Int ?? 1440) ?? .p1440
+        streamGameVolume = defaults.object(forKey: Key.streamGameVolume) as? Double ?? 1
+    }
+
+    /// Reads the stream keys from the keychain: call it only when going live.
+    func makeStreamConfig() -> StreamConfig {
+        let sites = StreamSite.allCases.filter { streamEnabled[$0] == true }.map { site -> StreamSiteConfig in
+            let server = (streamServer[site] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            return StreamSiteConfig(site: site, server: server.isEmpty ? site.defaultServer : server,
+                                    key: StreamKeychain.key(for: site) ?? "",
+                                    quality: site == .youtube ? streamYouTubeQuality : .p1080,
+                                    bitrate: streamBitrate[site] ?? 0)
+        }
+        return StreamConfig(sites: sites, gameVolume: Float(streamGameVolume), camera: nil, mic: nil)
     }
 }
