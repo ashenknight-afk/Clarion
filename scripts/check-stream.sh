@@ -11,6 +11,7 @@ SOURCES=(
   Clarion/RTMPConnection.swift
   Clarion/StreamVideoEncoder.swift
   Clarion/StreamAudio.swift
+  Clarion/MicInput.swift
   Clarion/StreamCompositor.swift
   Clarion/Recorder.swift
   Clarion/StreamKeychain.swift

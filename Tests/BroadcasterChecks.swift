@@ -136,6 +136,73 @@ private func oneSite(_ site: StreamSite = .twitch, quality: StreamQuality = .p10
                  gameVolume: 1, camera: nil, mic: nil)
 }
 
+/// Stands in for `MicInput`: a 1 kHz tone in 10 ms pieces on the host clock, and states on demand.
+private final class FakeMic: MicSource {
+    var onSamples: (([Float], Double) -> Void)?
+    var onState: ((MicInput.State) -> Void)?
+    private let queue = DispatchQueue(label: "BroadcasterChecks.mic", qos: .userInitiated)
+    private var timer: DispatchSourceTimer?
+    private let started = Locked<[(deviceID: String?, removeGameSound: Bool)]>([])
+    private let stops = Locked(0)
+    var startCalls: [(deviceID: String?, removeGameSound: Bool)] { started.value }
+    var stopCount: Int { stops.value }
+
+    func start(deviceID: String?, removeGameSound: Bool) {
+        started.update { $0.append((deviceID, removeGameSound)) }
+        queue.sync {
+            let origin = CACurrentMediaTime()
+            var pieces = 0
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now(), repeating: 0.005, leeway: .milliseconds(1))
+            timer.setEventHandler { [weak self] in
+                while origin + Double(pieces + 1) * 0.01 <= CACurrentMediaTime() {
+                    var samples = [Float](repeating: 0, count: 960)
+                    for i in 0..<480 {
+                        let value = Float(0.3 * sin(2 * Double.pi * 1000 * Double(pieces * 480 + i) / 48_000))
+                        samples[i * 2] = value
+                        samples[i * 2 + 1] = value
+                    }
+                    self?.onSamples?(samples, origin + Double(pieces) * 0.01)
+                    pieces += 1
+                }
+            }
+            timer.resume()
+            self.timer = timer
+        }
+        onState?(.running("Stand-in"))
+    }
+
+    func stop() {
+        stops.update { $0 += 1 }
+        queue.sync { timer?.cancel(); timer = nil }
+    }
+
+    /// The microphone goes away: no more sound, and the state says so.
+    func disconnect() {
+        queue.sync { timer?.cancel(); timer = nil }
+        onState?(.unavailable("Stand-in"))
+    }
+}
+
+/// How strongly a tone at `frequency` is in the left channel of interleaved 48 kHz stereo blocks, as an amplitude.
+private func toneLevel(_ blocks: [[Float]], frequency: Double) -> Double {
+    let left = blocks.flatMap { block in stride(from: 0, to: block.count, by: 2).map { Double(block[$0]) } }
+    guard !left.isEmpty else { return 0 }
+    var real = 0.0, imaginary = 0.0
+    for (i, value) in left.enumerated() {
+        let angle = 2 * Double.pi * frequency * Double(i) / 48_000
+        real += value * cos(angle)
+        imaginary += value * sin(angle)
+    }
+    return 2 * (real * real + imaginary * imaginary).squareRoot() / Double(left.count)
+}
+
+private func micConfig(port: UInt16, volume: Float = 1, removeGameSound: Bool = true) -> StreamConfig {
+    var config = oneSite(port: port, key: "abc")
+    config.mic = (deviceID: "usb-mic", volume: volume, removeGameSound: removeGameSound)
+    return config
+}
+
 private func bytes(_ message: RTMPMessage, _ count: Int = 2) -> [UInt8] { Array(message.payload.prefix(count)) }
 
 private func site(_ site: StreamSite, quality: StreamQuality = .p1080, bitrate: Int = 0, port: UInt16, key: String) -> StreamSiteConfig {
@@ -481,5 +548,99 @@ func broadcasterChecks() {
         spin(timeout: 1) { broadcaster.notice != nil }
         try expect(!broadcaster.isLive, "still live")
         try expect(broadcaster.notice?.contains("Connection lost") == true, "notice \(broadcaster.notice ?? "nil")")
+    }
+
+    check("the microphone is mixed with the game, muted with toggleMicMute, and unmuted again") {
+        let server = try RTMPTestServer(behaviour: .accept)
+        defer { server.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        let mic = FakeMic()
+        broadcaster.micSource = mic
+        let blocks = Locked<[[Float]]>([])
+        broadcaster.onSoundBlock = { samples, _ in blocks.update { $0.append(samples) } }
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(micConfig(port: server.port, removeGameSound: false))
+        try expect(spin(timeout: 5) { broadcaster.states[.twitch] == .live }, "not live")
+        try expect(mic.startCalls.count == 1 && mic.startCalls[0].deviceID == "usb-mic" && !mic.startCalls[0].removeGameSound,
+                   "start calls \(mic.startCalls)")
+        try expect(broadcaster.micState == .running("Stand-in"), "state \(broadcaster.micState)")
+        spin(timeout: 1.5)
+        let both = Array(blocks.value.suffix(20))
+        try expect(both.count == 20, "\(both.count) blocks")
+        try expect(toneLevel(both, frequency: 440) > 0.15, "game tone \(toneLevel(both, frequency: 440))")
+        try expect(toneLevel(both, frequency: 1000) > 0.15, "mic tone \(toneLevel(both, frequency: 1000))")
+
+        broadcaster.toggleMicMute()
+        try expect(broadcaster.micMuted, "not muted")
+        // Past what the mixer had already cut.
+        spin(timeout: 0.8)
+        let mark = blocks.value.count
+        spin(timeout: 1.2)
+        let muted = Array(blocks.value[mark...].suffix(20))
+        try expect(muted.count == 20, "\(muted.count) muted blocks")
+        try expect(toneLevel(muted, frequency: 440) > 0.15, "game tone while muted \(toneLevel(muted, frequency: 440))")
+        try expect(toneLevel(muted, frequency: 1000) < 0.03, "mic tone while muted \(toneLevel(muted, frequency: 1000))")
+
+        broadcaster.toggleMicMute()
+        try expect(!broadcaster.micMuted, "still muted")
+        spin(timeout: 0.8)
+        let mark2 = blocks.value.count
+        spin(timeout: 1.2)
+        let back = Array(blocks.value[mark2...].suffix(20))
+        try expect(toneLevel(back, frequency: 1000) > 0.15, "mic tone after unmute \(toneLevel(back, frequency: 1000))")
+
+        try ends(broadcaster)
+        try expect(mic.stopCount >= 1, "microphone not stopped")
+        try expect(broadcaster.micState == .off, "state after end \(broadcaster.micState)")
+        // Muting is for a live stream; it starts unmuted next time.
+        broadcaster.toggleMicMute()
+        try expect(!broadcaster.micMuted, "muted while not live")
+    }
+
+    check("a microphone that goes away leaves the stream live with a notice") {
+        let server = try RTMPTestServer(behaviour: .accept)
+        defer { server.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        let mic = FakeMic()
+        broadcaster.micSource = mic
+        let blocks = Locked<[[Float]]>([])
+        broadcaster.onSoundBlock = { samples, _ in blocks.update { $0.append(samples) } }
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(micConfig(port: server.port))
+        try expect(spin(timeout: 5) { broadcaster.states[.twitch] == .live }, "not live")
+        spin(timeout: 1)
+        mic.disconnect()
+        try expect(spin(timeout: 2) { broadcaster.notice == "Microphone disconnected" }, "notice \(broadcaster.notice ?? "nil")")
+        try expect(broadcaster.micState == .unavailable("Stand-in"), "state \(broadcaster.micState)")
+        let before = server.received.filter { $0.type == 8 }.count
+        spin(timeout: 1.5)
+        let after = server.received.filter { $0.type == 8 }.count
+        try expect(broadcaster.states[.twitch] == .live && broadcaster.isLive, "no longer live")
+        try expect(after - before >= 30, "only \(after - before) audio messages in 1.5 s")
+        // Past the mixer's delay the microphone's queued sound is gone; the game is still there.
+        let tail = Array(blocks.value.suffix(15))
+        try expect(toneLevel(tail, frequency: 440) > 0.15, "game tone \(toneLevel(tail, frequency: 440))")
+        try expect(toneLevel(tail, frequency: 1000) < 0.03, "mic tone after it left \(toneLevel(tail, frequency: 1000))")
+        try ends(broadcaster)
+    }
+
+    check("a stream without a microphone setting never starts one") {
+        let server = try RTMPTestServer(behaviour: .accept)
+        defer { server.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        let mic = FakeMic()
+        broadcaster.micSource = mic
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(oneSite(port: server.port, key: "abc"))
+        try expect(spin(timeout: 5) { broadcaster.states[.twitch] == .live }, "not live")
+        try expect(mic.startCalls.isEmpty, "microphone started")
+        try expect(broadcaster.micState == .off, "state \(broadcaster.micState)")
+        try ends(broadcaster)
     }
 }

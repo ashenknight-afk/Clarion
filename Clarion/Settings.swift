@@ -64,6 +64,10 @@ final class AppSettings: ObservableObject {
         static func streamBitrate(_ site: StreamSite) -> String { "stream.\(site.rawValue).bitrate" }
         static let streamYouTubeQuality = "stream.youtube.quality"
         static let streamGameVolume = "stream.gameVolume"
+        static let micEnabled = "stream.mic.enabled"
+        static let micDeviceID = "stream.mic.deviceID"
+        static let micVolume = "stream.mic.volume"
+        static let micRemoveGameSound = "stream.mic.removeGameSound"
     }
 
     private let defaults: UserDefaults
@@ -123,6 +127,13 @@ final class AppSettings: ObservableObject {
     }
     /// 0…1.
     @Published var streamGameVolume: Double { didSet { defaults.set(streamGameVolume, forKey: Key.streamGameVolume) } }
+    @Published var micEnabled: Bool { didSet { defaults.set(micEnabled, forKey: Key.micEnabled) } }
+    /// nil = the system's default input.
+    @Published var micDeviceID: String? { didSet { defaults.set(micDeviceID, forKey: Key.micDeviceID) } }
+    /// 0…1.
+    @Published var micVolume: Double { didSet { defaults.set(micVolume, forKey: Key.micVolume) } }
+    /// Voice processing cancels the game's sound out of the microphone, for when it plays from speakers.
+    @Published var micRemoveGameSound: Bool { didSet { defaults.set(micRemoveGameSound, forKey: Key.micRemoveGameSound) } }
     /// A measuring aid, so it always starts off.
     @Published var latencyTest = false
 
@@ -176,6 +187,10 @@ final class AppSettings: ObservableObject {
         streamBitrate = Dictionary(uniqueKeysWithValues: StreamSite.allCases.map { ($0, max(0, defaults.integer(forKey: Key.streamBitrate($0)))) })
         streamYouTubeQuality = StreamQuality(rawValue: defaults.object(forKey: Key.streamYouTubeQuality) as? Int ?? 1440) ?? .p1440
         streamGameVolume = defaults.object(forKey: Key.streamGameVolume) as? Double ?? 1
+        micEnabled = defaults.object(forKey: Key.micEnabled) as? Bool ?? true
+        micDeviceID = defaults.string(forKey: Key.micDeviceID)
+        micVolume = defaults.object(forKey: Key.micVolume) as? Double ?? 1
+        micRemoveGameSound = defaults.object(forKey: Key.micRemoveGameSound) as? Bool ?? true
     }
 
     /// Reads the stream keys from the keychain: call it only when going live.
@@ -187,6 +202,7 @@ final class AppSettings: ObservableObject {
                                     quality: site == .youtube ? streamYouTubeQuality : .p1080,
                                     bitrate: streamBitrate[site] ?? 0)
         }
-        return StreamConfig(sites: sites, gameVolume: Float(streamGameVolume), camera: nil, mic: nil)
+        return StreamConfig(sites: sites, gameVolume: Float(streamGameVolume), camera: nil,
+                            mic: micEnabled ? (micDeviceID, Float(micVolume), micRemoveGameSound) : nil)
     }
 }

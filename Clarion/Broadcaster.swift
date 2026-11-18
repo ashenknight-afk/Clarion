@@ -68,6 +68,10 @@ final class Broadcaster: ObservableObject {
     @Published private(set) var notice: String?
     /// Bitrate sent and canvas per site, shown next to its state.
     @Published private(set) var info: [StreamSite: String] = [:]
+    @Published private(set) var micMuted = false
+    @Published private(set) var micState: MicInput.State = .off
+    /// Checks only: stands in for the microphone. Set before `goLive`.
+    var micSource: MicSource = MicInput()
     /// Checks only: scales reconnect pauses and timeouts. Set before `goLive`.
     var timeScale = 1.0
 
@@ -97,6 +101,8 @@ final class Broadcaster: ObservableObject {
 
     // main thread only
     private var ending = false
+    /// Tells a microphone's reports from this stream apart from those of an earlier one.
+    private var micSession = 0
     /// Completions of `end` calls made while an end was already running.
     private var endCompletions: [() -> Void] = []
 
@@ -149,6 +155,19 @@ final class Broadcaster: ObservableObject {
         lock.unlock()
         let timeScale = self.timeScale
         queue.async { self.start(config, timeScale: timeScale) }
+        startMic(config.mic)
+    }
+
+    /// Muting is for a live stream: it starts unmuted and does nothing otherwise.
+    func toggleMicMute() {
+        switch micState {
+        case .running, .plainFallback, .needsPermission: break
+        case .off, .denied, .unavailable: return
+        }
+        guard isLive else { return }
+        micMuted.toggle()
+        let muted = micMuted
+        queue.async { self.mixer?.micMuted = muted }
     }
 
     /// Ends every site cleanly. `completion` runs on the main thread once all are closed.
@@ -232,6 +251,44 @@ final class Broadcaster: ObservableObject {
         lock.unlock()
         onWantsFrames?(false)
         onWantsAudio?(false)
+        stopMic()
+    }
+
+    private func startMic(_ mic: (deviceID: String?, volume: Float, removeGameSound: Bool)?) {
+        micSession += 1
+        micMuted = false
+        guard let mic else { return micState = .off }
+        let session = micSession
+        micSource.onSamples = { [weak self] samples, hostTime in self?.handle(micSamples: samples, hostTime: hostTime) }
+        micSource.onState = { [weak self] state in
+            DispatchQueue.main.async { self?.micChanged(state, session: session) }
+        }
+        micSource.start(deviceID: mic.deviceID, removeGameSound: mic.removeGameSound)
+    }
+
+    private func stopMic() {
+        micSession += 1
+        micSource.onSamples = nil
+        micSource.onState = nil
+        micSource.stop()
+        micState = .off
+        micMuted = false
+    }
+
+    /// The stream goes on without the microphone when it goes away or isn't allowed.
+    private func micChanged(_ state: MicInput.State, session: Int) {
+        guard session == micSession else { return }
+        micState = state
+        switch state {
+        case .unavailable:
+            notice = "Microphone disconnected"
+        case .denied:
+            notice = "Clarion isn't allowed to use the microphone"
+        default:
+            return
+        }
+        micMuted = false
+        queue.async { self.mixer?.remove(.mic) }
     }
 
     private func publish(_ state: SiteState, for site: StreamSite) {
@@ -255,6 +312,7 @@ final class Broadcaster: ObservableObject {
         composing = []
         var mixer = StreamMixer(startHostTime: now)
         mixer.volume[.game] = config.gameVolume
+        mixer.micMuted = false
         if let mic = config.mic { mixer.volume[.mic] = mic.volume }
         self.mixer = mixer
         audioEncoder = StreamAudioEncoder()

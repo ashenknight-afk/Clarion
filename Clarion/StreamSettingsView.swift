@@ -1,3 +1,4 @@
+import AVFoundation
 import Security
 import SwiftUI
 
@@ -15,6 +16,7 @@ struct StreamSettingsSection: View {
         @Published var showAdvanced = false
         /// Set when the keychain refused a save or a removal. Never contains the key.
         @Published var keyError: String?
+        @Published var micDevices: [CaptureDeviceInfo] = []
     }
 
     @StateObject private var model = Model()
@@ -33,6 +35,9 @@ struct StreamSettingsSection: View {
             }
         }
         .onAppear {
+            model.micDevices = AVCaptureDevice.DiscoverySession(deviceTypes: [.microphone, .external], mediaType: .audio,
+                                                                position: .unspecified).devices
+                .map { CaptureDeviceInfo(id: $0.uniqueID, name: $0.localizedName, modelID: $0.modelID) }
             model.savedKeys = Dictionary(uniqueKeysWithValues: StreamSite.allCases.map { ($0, StreamKeychain.hasKey(for: $0)) })
         }
         .onChange(of: focusedKey) { previous, _ in
@@ -65,6 +70,35 @@ struct StreamSettingsSection: View {
                         }
                     }
                 }
+            }
+        }
+
+        Toggle("Microphone", isOn: $settings.micEnabled)
+            .disabled(broadcaster.isLive)
+        if settings.micEnabled {
+            Picker("Input", selection: $settings.micDeviceID) {
+                Text("System default").tag(String?.none)
+                ForEach(model.micDevices) { device in
+                    Text(device.name).tag(Optional(device.id))
+                }
+            }
+            .disabled(broadcaster.isLive)
+            LabeledContent("Microphone volume") {
+                HStack {
+                    Slider(value: $settings.micVolume, in: 0...1)
+                    Text(String(format: "%.0f%%", settings.micVolume * 100))
+                        .monospacedDigit()
+                        .frame(width: 44, alignment: .trailing)
+                }
+            }
+            .disabled(broadcaster.isLive)
+            Toggle("Remove game sound from the microphone", isOn: $settings.micRemoveGameSound)
+                .disabled(broadcaster.isLive)
+            Text("For when the game plays from speakers. macOS lowers other sound a little while this is on.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            if let line = micLine {
+                Text(line).font(.callout).foregroundStyle(micNeedsAttention ? .yellow : .secondary)
             }
         }
 
@@ -120,6 +154,25 @@ struct StreamSettingsSection: View {
                 .foregroundStyle(.secondary)
         }
         .disabled(broadcaster.isLive)
+    }
+
+    private var micLine: String? {
+        guard broadcaster.isLive else { return nil }
+        switch broadcaster.micState {
+        case .off: return nil
+        case .needsPermission: return "Microphone: waiting for permission"
+        case .denied: return "Microphone: not allowed. Turn it on in System Settings > Privacy & Security > Microphone."
+        case .running(let name): return "Microphone: \(name)" + (broadcaster.micMuted ? " (muted, N)" : " (N mutes)")
+        case .plainFallback(let name): return "Microphone: \(name). Game sound isn't removed from it here." + (broadcaster.micMuted ? " Muted." : "")
+        case .unavailable(let name): return "Microphone: \(name) disconnected"
+        }
+    }
+
+    private var micNeedsAttention: Bool {
+        switch broadcaster.micState {
+        case .denied, .unavailable, .plainFallback: return true
+        case .off, .needsPermission, .running: return false
+        }
     }
 
     private func status(_ site: StreamSite, now: Date) -> String? {

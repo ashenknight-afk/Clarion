@@ -27,7 +27,7 @@
 	<key>NSCameraUsageDescription</key>
 	<string>Clarion reads the video from your HDMI capture card so it can show your console on this Mac.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Clarion plays your capture card's game audio through this Mac's speakers.</string>
+	<string>Clarion plays your capture card's game audio and, when you go live, sends your microphone to your stream.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSPrincipalClass</key>

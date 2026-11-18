@@ -352,7 +352,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // A held key repeats: without this, holding P saved a burst of screenshots and holding R
         // could start and stop a recording.
         let key = event.charactersIgnoringModifiers?.lowercased()
-        if event.isARepeat { return key.map { "omusfalprv".contains($0) } ?? false }
+        if event.isARepeat { return key.map { "omusfalprvn".contains($0) } ?? false }
         switch key {
         case "o": settings.showOverlay.toggle()
         case "m": settings.scalingMode = settings.scalingMode.next
@@ -364,6 +364,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "p": recorder.takeScreenshot()
         case "r": recorder.toggleRecording()
         case "v": settings.displaySyncEnabled.toggle()
+        case "n": broadcaster?.toggleMicMute()
         default: return false
         }
         return true
