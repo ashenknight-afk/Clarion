@@ -59,4 +59,22 @@ func amf0Checks() {
             try expect(threw, "marker \(marker)")
         }
     }
+    check("amf0 nesting limit") {
+        func nested(_ levels: Int) -> Data {
+            var data = Data()
+            for _ in 0 ..< levels { data.append(contentsOf: [0x03, 0x00, 0x01, 0x61]) }
+            data.append(contentsOf: [0x05])
+            for _ in 0 ..< levels { data.append(contentsOf: [0x00, 0x00, 0x09]) }
+            return data
+        }
+        try expect(try AMF0.decode(nested(AMF0.maxDepth)).count == 1)
+        var threw = false
+        do { _ = try AMF0.decode(nested(AMF0.maxDepth + 1)) } catch { threw = true }
+        try expect(threw, "one past the limit")
+        var endless = Data()
+        for _ in 0 ..< 100_000 { endless.append(contentsOf: [0x03, 0x00, 0x01, 0x61]) }
+        threw = false
+        do { _ = try AMF0.decode(endless) } catch { threw = true }
+        try expect(threw, "100000 levels")
+    }
 }

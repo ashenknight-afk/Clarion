@@ -10,7 +10,10 @@ indirect enum AMF0: Equatable {
     case number(Double), boolean(Bool), string(String), null
     case object([Property]), ecmaArray([Property])
 
-    enum DecodeError: Error { case truncated, unsupported(UInt8) }
+    enum DecodeError: Error { case truncated, unsupported(UInt8), tooDeep }
+
+    /// Payloads come from a remote server, so nesting is capped to keep a hostile one from overflowing the stack.
+    static let maxDepth = 32
 
     func encode(into data: inout Data) {
         switch self {
@@ -89,7 +92,7 @@ indirect enum AMF0: Equatable {
             return String(decoding: try take(length), as: UTF8.self)
         }
 
-        mutating func properties() throws -> [Property] {
+        mutating func properties(depth: Int) throws -> [Property] {
             var result: [Property] = []
             while true {
                 let key = try string()
@@ -97,21 +100,24 @@ indirect enum AMF0: Equatable {
                     guard try integer(1) == 0x09 else { throw DecodeError.unsupported(0x09) }
                     return result
                 }
-                result.append(Property(key: key, value: try value()))
+                result.append(Property(key: key, value: try value(depth: depth)))
             }
         }
 
-        mutating func value() throws -> AMF0 {
+        mutating func value(depth: Int = 0) throws -> AMF0 {
             let marker = UInt8(try integer(1))
             switch marker {
             case 0x00: return .number(Double(bitPattern: try integer(8)))
             case 0x01: return .boolean(try integer(1) != 0)
             case 0x02: return .string(try string())
-            case 0x03: return .object(try properties())
+            case 0x03:
+                guard depth < AMF0.maxDepth else { throw DecodeError.tooDeep }
+                return .object(try properties(depth: depth + 1))
             case 0x05, 0x06: return .null
             case 0x08:
+                guard depth < AMF0.maxDepth else { throw DecodeError.tooDeep }
                 _ = try integer(4)
-                return .ecmaArray(try properties())
+                return .ecmaArray(try properties(depth: depth + 1))
             default: throw DecodeError.unsupported(marker)
             }
         }
