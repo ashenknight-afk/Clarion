@@ -32,6 +32,7 @@ private let checkGroups: [() -> Void] = [
     rtmpConnectionChecks,
     videoEncoderChecks,
     streamAudioChecks,
+    compositorChecks,
 ]
 
 @main
