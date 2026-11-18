@@ -42,33 +42,173 @@ final class StreamVideoEncoder {
         return status == noErr ? session : nil
     }
 
+    /// Holds the stream to the target byte rate, which the hardware encoder does not (measured:
+    /// it overshoots its average bitrate and data rate limit by 50% and more on busy pictures and
+    /// ignores CBR, QP limits and quality). It drops input frames rather than letting a burst out.
+    ///
+    /// Invariant: a frame is admitted only if the bytes output in the last second of presentation
+    /// time, plus every frame in flight costed at the larger of its reservation and the current
+    /// estimate for its kind, plus the frame itself (a keyframe with a quarter more), fit the
+    /// target. Estimates are the largest frame of that kind in the last second (a keyframe: the
+    /// last keyframe, never less than a delta), falling back to the largest frame there is. So a
+    /// second goes over only by what frames outgrow their estimates. A lone frame (nothing in the window or in
+    /// flight) is always admitted: a frame bigger than the budget would otherwise stop the stream.
+    ///
+    /// The window alone lets a burst through at the start of each second and refuses the rest,
+    /// so delta frames are also paced by a credit charged with their actual size. It refills at
+    /// the target less a keyframe (one comes every 2 s, so every second is within a second of
+    /// one). The pace yields after three drops in a row, so viewers see a lower frame rate rather
+    /// than a frozen picture; the window never yields, since holding the rate comes first.
+    /// Possible later improvement: lower the session's average bitrate while shedding, so the
+    /// encoder stops spending the dropped frames' budget on the frames it gets.
+    private struct RateGuard {
+        let target: Double
+        /// Seconds after a keyframe when the guard forces the next one, a little before the
+        /// encoder's own 2 s limit would, so the kind of every frame is known when it is costed.
+        let keyframeInterval: Double
+        private var window: [(time: Double, bytes: Int, keyframe: Bool)] = []
+        private var windowBytes = 0
+        private var inFlight: [(keyframe: Bool, reserved: Int, charged: Double)] = []
+        private var largestSeen: Int?
+        private var lastDeltaBytes = 0
+        private var lastKeyframeBytes: Int?
+        private var lastKeyframeTime: Double?
+        private var lastTime: Double?
+        private var credit = 0.0
+        private var dropsInRow = 0
+        /// Set while a keyframe is wanted and not yet handed to the encoder.
+        private var keyframePending = false
+
+        init(target: Double, frameRate: Int) {
+            self.target = target
+            keyframeInterval = 2 - 1.5 / Double(max(frameRate, 1))
+        }
+
+        private func cost(keyframe: Bool) -> Int? {
+            let deltas = window.lazy.filter { !$0.keyframe }.map(\.bytes).max()
+            let delta = deltas ?? window.lazy.map(\.bytes).max() ?? largestSeen
+            guard keyframe else { return delta }
+            guard let last = lastKeyframeBytes ?? largestSeen else { return delta }
+            return max(last, delta ?? 0)
+        }
+
+        /// Returns whether the frame should be a keyframe, or nil to drop it. An admitted frame
+        /// must be followed by `sent` or `failed`.
+        mutating func admit(at time: Double, forceKeyframe: Bool) -> Bool? {
+            if let last = lastTime, time < last {
+                // Input time went backwards: the old window says nothing about the new stretch.
+                window.removeAll()
+                windowBytes = 0
+                lastKeyframeTime = nil
+                credit = 0
+            }
+            let elapsed = lastTime.map { min(max(time - $0, 0), 1) } ?? 0
+            lastTime = time
+            while let first = window.first, first.time <= time - 1 {
+                windowBytes -= first.bytes
+                window.removeFirst()
+            }
+            if forceKeyframe || lastKeyframeTime.map({ time - $0 >= keyframeInterval }) ?? true {
+                keyframePending = true
+            }
+            let keyframe = keyframePending
+            // Every second is within a second of a keyframe, so deltas get what one leaves, less
+            // a little so the window itself rarely has to refuse a frame (that is what makes runs).
+            let pace = max(target - Double(cost(keyframe: true) ?? 0), target / 4) * 0.95
+            credit = min(credit + pace * elapsed, pace / 10)
+
+            let lone = window.isEmpty && inFlight.isEmpty
+            guard let candidate = cost(keyframe: keyframe) else {
+                // Nothing has come out yet, so no size is known: one frame at a time.
+                guard lone else { return drop() }
+                inFlight.append((keyframe, 0, 0))
+                dropsInRow = 0
+                return keyframe
+            }
+            if !lone {
+                if !keyframe && credit < 0 && dropsInRow < 3 { return drop() }
+                let pending = inFlight.reduce(0) { $0 + max($1.reserved, cost(keyframe: $1.keyframe) ?? 0) }
+                // A keyframe needs a quarter more room: fed sparsely, the encoder spends what drops
+                // left unused on it (measured: 493 KB after a 368 KB one).
+                let growth = keyframe ? Double(candidate) / 4 : 0
+                if Double(windowBytes + pending + candidate) + growth > target { return drop() }
+            }
+            let charge = keyframe ? 0 : Double(lastDeltaBytes)
+            inFlight.append((keyframe, candidate, charge))
+            credit -= charge
+            dropsInRow = 0
+            return keyframe
+        }
+
+        private mutating func drop() -> Bool? {
+            dropsInRow += 1
+            return nil
+        }
+
+        /// The encoder took the frame admitted last.
+        mutating func sent(keyframe: Bool, at time: Double) {
+            if keyframe {
+                keyframePending = false
+                lastKeyframeTime = time
+            }
+        }
+
+        /// The encoder refused the frame admitted last; a keyframe request stays pending.
+        mutating func failed() {
+            guard let last = inFlight.popLast() else { return }
+            credit += last.charged
+        }
+
+        /// The oldest frame in flight came out (no reordering, so output is in input order).
+        mutating func landed(time: Double, bytes: Int, keyframe: Bool) {
+            let entry = inFlight.isEmpty ? nil : inFlight.removeFirst()
+            window.append((time, bytes, keyframe))
+            windowBytes += bytes
+            largestSeen = max(largestSeen ?? 0, bytes)
+            if keyframe {
+                lastKeyframeBytes = bytes
+                // The encoder may add one of its own; the schedule counts from it.
+                lastKeyframeTime = max(lastKeyframeTime ?? time, time)
+            } else {
+                // The credit was charged an estimate; settle it at the real size.
+                credit += (entry?.charged ?? 0) - Double(bytes)
+                lastDeltaBytes = bytes
+            }
+        }
+
+        /// The oldest frame in flight failed in the encoder.
+        mutating func lost() {
+            guard !inFlight.isEmpty else { return }
+            credit += inFlight.removeFirst().charged
+        }
+    }
+
     /// State the session's callback shares with the encoder. The callback holds this, never the
     /// encoder, so the last reference to the encoder can be dropped on any thread, including the
     /// VideoToolbox one.
     private final class Output {
-        /// Recursive so `onFrame` may call back into the encoder.
-        let lock = NSRecursiveLock()
+        let lock = NSCondition()
         let onFrame: (Frame) -> Void
         var closed = false
+        /// onFrame calls running now; invalidate waits for them.
+        var delivering = 0
         var dropped = 0
-        var inFlight = 0
-        /// Recent output as (presentation seconds, bytes), for the rate guard.
-        var window: [(time: Double, bytes: Int, keyframe: Bool)] = []
-        var windowBytes = 0
-        var largestKeyframe = 0
-        var lastKeyframeTime: Double?
-        /// A forced keyframe the guard dropped; the next admitted frame carries it.
-        var keyframePending = false
-        init(onFrame: @escaping (Frame) -> Void) { self.onFrame = onFrame }
+        var rate: RateGuard
+        init(onFrame: @escaping (Frame) -> Void, rate: RateGuard) {
+            self.onFrame = onFrame
+            self.rate = rate
+        }
 
-        static let callbackKey = "StreamVideoEncoder.callback"
+        /// Per thread: the outputs whose onFrame that thread is inside.
+        static let callbackKey = "StreamVideoEncoder.callbacks"
+        static var activeOnThisThread: NSCountedSet? {
+            Thread.current.threadDictionary[callbackKey] as? NSCountedSet
+        }
     }
 
     private let lock = NSLock()
     private var session: VTCompressionSession?
     private let output: Output
-    /// Bytes per second the guard lets through before it drops input (the target).
-    private let guardBytesPerSecond: Double
 
     /// Frames not encoded: refused by the session, failed or empty in the callback, or dropped
     /// by the rate guard.
@@ -80,8 +220,7 @@ final class StreamVideoEncoder {
 
     init?(width: Int, height: Int, bitrate: Int, frameRate: Int, onFrame: @escaping (Frame) -> Void) {
         guard let session = Self.makeSession(width: width, height: height) else { return nil }
-        output = Output(onFrame: onFrame)
-        guardBytesPerSecond = Double(bitrate) / 8
+        output = Output(onFrame: onFrame, rate: RateGuard(target: Double(bitrate) / 8, frameRate: frameRate))
 
         func set(_ key: CFString, _ value: Any) -> Bool {
             VTSessionSetProperty(session, key: key, value: value as CFTypeRef) == noErr
@@ -112,7 +251,13 @@ final class StreamVideoEncoder {
         self.session = nil
         lock.unlock()
         guard let session else { return }
-        close(then: session)
+        output.lock.lock()
+        output.closed = true
+        output.lock.unlock()
+        DispatchQueue.global(qos: .utility).async {
+            VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+            VTCompressionSessionInvalidate(session)
+        }
     }
 
     /// Returns false when the frame was not accepted (counted in `droppedFrames`). If the rate
@@ -122,37 +267,14 @@ final class StreamVideoEncoder {
         lock.lock()
         defer { lock.unlock() }
         guard let session else { return false }
-        let seconds = time.seconds
         let output = self.output
 
         output.lock.lock()
-        if output.closed { output.lock.unlock(); return false }
-        // Input time went backwards: the old window says nothing about the new stretch.
-        if let first = output.window.first, first.time > seconds {
-            output.window.removeAll()
-            output.windowBytes = 0
-        }
-        while let first = output.window.first, first.time <= seconds - 1 {
-            output.windowBytes -= first.bytes
-            output.window.removeFirst()
-        }
-        let keyframe = forceKeyframe || output.keyframePending
-        // Cost of this frame and those still in the encoder: the largest recent delta frame each
-        // (a keyframe in the window would make every in-flight frame cost a keyframe), and
-        // for a keyframe (forced or due, the interval being 2 s) the largest keyframe seen.
-        let largest = output.window.lazy.filter { !$0.keyframe }.map(\.bytes).max() ?? 0
-        let keyframeDue = output.lastKeyframeTime.map { seconds - $0 >= 1.9 } ?? false
-        let candidate = keyframe || keyframeDue ? max(largest, output.largestKeyframe) : largest
-        let projected = Double(output.windowBytes + output.inFlight * largest + candidate)
-        // Until the first output shows what a frame costs, only a few may be in flight.
-        if projected > guardBytesPerSecond || (output.window.isEmpty && output.inFlight >= 6) {
+        guard !output.closed, let keyframe = output.rate.admit(at: time.seconds, forceKeyframe: forceKeyframe) else {
             output.dropped += 1
-            if keyframe { output.keyframePending = true }
             output.lock.unlock()
             return false
         }
-        output.keyframePending = false
-        output.inFlight += 1
         output.lock.unlock()
 
         let properties: CFDictionary? = keyframe ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
@@ -163,25 +285,32 @@ final class StreamVideoEncoder {
         ) { status, _, sample in
             Self.handle(status: status, sample: sample, output: output)
         }
-        if status != noErr {
-            // The handler is not called when the call itself fails.
-            output.lock.lock()
-            output.inFlight -= 1
+        output.lock.lock()
+        defer { output.lock.unlock() }
+        // The handler is not called when the call itself fails.
+        guard status == noErr else {
+            output.rate.failed()
             output.dropped += 1
-            output.lock.unlock()
             return false
         }
+        output.rate.sent(keyframe: keyframe, at: time.seconds)
         return true
     }
 
     /// Completes pending frames, then tears the session down. No output follows its return.
+    /// Called from an encoder's onFrame, it drops pending frames instead and finishes the
+    /// teardown on another thread.
     func invalidate() {
-        if Thread.current.threadDictionary[Output.callbackKey] != nil {
-            // Called from onFrame. Neither the encoder's lock (a thread in `encode` may hold it
-            // while waiting for this callback) nor the session may be waited on from here: stop
-            // output now and finish the teardown on another thread.
+        let active = Output.activeOnThisThread
+        if let active, active.count > 0 {
+            // Neither the encoder's lock (a thread in `encode` may hold it while VideoToolbox
+            // waits for this thread) nor the session may be waited on from here. Stop output now;
+            // wait for onFrame calls on other threads unless this is one of ours.
             output.lock.lock()
             output.closed = true
+            if !active.contains(output) {
+                while output.delivering > 0 { output.lock.wait() }
+            }
             output.lock.unlock()
             DispatchQueue.global(qos: .utility).async { self.invalidate() }
             return
@@ -190,48 +319,40 @@ final class StreamVideoEncoder {
         let session = self.session
         self.session = nil
         lock.unlock()
-        guard let session else { return }
-        VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+        if let session { VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid) }
         output.lock.lock()
         output.closed = true
+        while output.delivering > 0 { output.lock.wait() }
         output.lock.unlock()
-        VTCompressionSessionInvalidate(session)
-    }
-
-    /// Stops output now and finishes the session off the calling thread.
-    private func close(then session: VTCompressionSession) {
-        output.lock.lock()
-        output.closed = true
-        output.lock.unlock()
-        DispatchQueue.global(qos: .utility).async {
-            VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
-            VTCompressionSessionInvalidate(session)
-        }
+        if let session { VTCompressionSessionInvalidate(session) }
     }
 
     private static func handle(status: OSStatus, sample: CMSampleBuffer?, output: Output) {
         let frame = status == noErr ? sample.flatMap(makeFrame) : nil
         output.lock.lock()
-        output.inFlight -= 1
         guard let frame else {
+            output.rate.lost()
             output.dropped += 1
             output.lock.unlock()
             return
         }
-        output.window.append((frame.time.seconds, frame.avcc.count, frame.keyframe))
-        output.windowBytes += frame.avcc.count
-        if frame.keyframe {
-            output.largestKeyframe = max(output.largestKeyframe, frame.avcc.count)
-            output.lastKeyframeTime = frame.time.seconds
-        }
-        let closed = output.closed
+        output.rate.landed(time: frame.time.seconds, bytes: frame.avcc.count, keyframe: frame.keyframe)
+        if output.closed { output.lock.unlock(); return }
+        output.delivering += 1
         // Not held across onFrame: it may take a while or call back into the encoder.
         output.lock.unlock()
-        if closed { return }
-        let marker = Thread.current.threadDictionary
-        marker[Output.callbackKey] = true
+
+        let dictionary = Thread.current.threadDictionary
+        let active = dictionary[Output.callbackKey] as? NSCountedSet ?? NSCountedSet()
+        dictionary[Output.callbackKey] = active
+        active.add(output)
         output.onFrame(frame)
-        marker.removeObject(forKey: Output.callbackKey)
+        active.remove(output)
+
+        output.lock.lock()
+        output.delivering -= 1
+        if output.delivering == 0 { output.lock.broadcast() }
+        output.lock.unlock()
     }
 
     private static func makeFrame(_ sample: CMSampleBuffer) -> Frame? {
