@@ -103,8 +103,11 @@ struct StreamMixer {
     private static let rate = 48_000.0
     /// Sound further ahead of the output than this is a bad timestamp, not something to hold on to.
     private static let farAhead = Int(2 * rate)
-    /// Disagreement under this is left alone; above it (and under `resyncAfter`) it is eased out.
-    private static let deadband = 48
+    /// Smoothed disagreement (frames) under this is left alone; above it (and under `resyncAfter`) it is eased out.
+    private static let deadband = 96.0
+    /// How long the disagreement is averaged over before it is acted on, so jitter on a source with a
+    /// correct clock averages out and only a real rate difference gets corrected.
+    private static let smoothing = 1.0
 
     var volume: [Source: Float] = [.game: 1, .mic: 1]
     var micMuted = false
@@ -114,6 +117,13 @@ struct StreamMixer {
         var queue: [Float] = []
         /// Output frame (from the start) where this source's timeline ends. Nil until it first pushes.
         var endFrame: Int?
+        /// Frames pushed since the last (re)alignment. The first second only measures `reference`.
+        var warmFrames = 0
+        /// Average disagreement (frames) over that first second: the anchor was one jittered stamp, so
+        /// an offset that stays constant is not drift and is left alone.
+        var reference = 0.0
+        /// Running average of the disagreement beyond `reference`, in frames.
+        var smoothed = 0.0
     }
 
     private let startHostTime: Double
@@ -131,11 +141,18 @@ struct StreamMixer {
         return Double(max(0, end - emitted)) / Self.rate
     }
 
+    /// Host time where the source's timeline ends, nil if it has not pushed.
+    func timelineEnd(_ source: Source) -> Double? {
+        tracks[source]?.endFrame.map { startHostTime + Double($0) / Self.rate }
+    }
+
     mutating func push(_ source: Source, samples: [Float], hostTime: Double) {
         let frames = samples.count / 2
-        guard frames > 0 else { return }
+        guard frames > 0, hostTime.isFinite else { return }
+        let position = (hostTime - startHostTime) * Self.rate
+        guard abs(position) < 1e12 else { return }
         var track = tracks[source] ?? Track()
-        let target = Int(((hostTime - startHostTime) * Self.rate).rounded())
+        let target = Int(position.rounded())
         var data = samples[0..<(frames * 2)]
 
         if target > emitted + Self.farAhead { return }
@@ -152,11 +169,24 @@ struct StreamMixer {
                     // Earlier: the overlap was already queued.
                     data = data.dropFirst(min(-diff, frames) * 2)
                 }
-            } else if abs(diff) > Self.deadband {
-                // Clock drift or jitter: ease it out a little per push, so a source that is slightly
-                // fast or slow neither piles up nor needs a realignment click every few seconds.
-                let step = min(abs(diff), max(1, frames / 400))
-                if diff > 0 {
+                track.smoothed = 0
+                track.reference = 0
+                track.warmFrames = 0
+            } else if track.warmFrames < Int(Self.rate * Self.smoothing) {
+                track.reference += (Double(diff) - track.reference) * Double(frames) / Double(track.warmFrames + frames)
+                track.warmFrames += frames
+            } else {
+                let error = Double(diff) - track.reference
+                track.smoothed += (error - track.smoothed) * min(1, Double(frames) / (Self.rate * Self.smoothing))
+            }
+            if abs(diff) <= Int(Self.resyncAfter * Self.rate), track.warmFrames >= Int(Self.rate * Self.smoothing),
+               abs(track.smoothed) > Self.deadband {
+                // Clock drift: ease it out a little per push, so a source that is slightly fast or
+                // slow neither piles up nor needs a realignment click every few seconds.
+                let step = min(Int(abs(track.smoothed)), max(1, frames / 400))
+                let late = track.smoothed > 0
+                track.smoothed += late ? -Double(step) : Double(step)
+                if late {
                     // Hold the last frame, not silence.
                     let l = track.queue.count >= 2 ? track.queue[track.queue.count - 2] : 0
                     let r = track.queue.count >= 2 ? track.queue[track.queue.count - 1] : 0
@@ -184,6 +214,7 @@ struct StreamMixer {
     }
 
     mutating func pull(now: Double) -> [(samples: [Float], hostTime: Double)] {
+        guard now.isFinite else { return [] }
         var blocks: [(samples: [Float], hostTime: Double)] = []
         let block = Self.blockFrames
         while startHostTime + Double(emitted + block) / Self.rate <= now - Self.delay {
@@ -242,7 +273,7 @@ final class StreamAudioEncoder {
         converter.bitRate = bitrate
         self.converter = converter
         self.input = input
-        output = AVAudioCompressedBuffer(format: aac, packetCapacity: 4,
+        output = AVAudioCompressedBuffer(format: aac, packetCapacity: 1,
                                          maximumPacketSize: max(converter.maximumOutputPacketSize, 1024))
     }
 

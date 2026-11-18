@@ -104,35 +104,87 @@ func streamAudioChecks() {
         try expect(mixed[from..<to].allSatisfy { $0 != 0 }, "zeros inside at \(mixed[from..<to].firstIndex { $0 == 0 }.map { Double($0 / 2) / rate } ?? -1) of \(mixed.count)")
     }
 
-    check("a fast source never builds up a queue") {
+    check("a fast source stays within 100 ms of the host clock and does not drift away") {
         var mixer = StreamMixer(startHostTime: start)
         let chunk = 0.02
-        let frames = Int(chunk * rate)
         let samples = constant(0.3, seconds: chunk)
-        let drift = 1.001
-        var worst = 0.0, firstSecondWorst = 0.0, lastSecondWorst = 0.0
-        var pulled = 0
-        var t = 0.0 // source's own clock
+        var worst = 0.0, early = 0.0, late = 0.0
         var zeros = 0
+        var t = 0.0 // the source's own clock, running 0.1% fast against the host
         while t < 60 {
-            // Its sound is stamped by the host clock but made 0.1% faster than it.
-            let host = start + 0.05 + t / drift
-            let now = host + chunk + 0.04
+            let host = start + 0.05 + t / 1.001
+            let now = host + chunk
             mixer.push(.game, samples: samples, hostTime: host)
-            for block in mixer.pull(now: now) {
-                pulled += 1
-                if t > 1, block.samples.contains(0) { zeros += 1 }
-            }
-            let q = mixer.queuedSeconds(.game)
-            worst = max(worst, q)
-            if t < 5 { firstSecondWorst = max(firstSecondWorst, q) }
-            if t > 55 { lastSecondWorst = max(lastSecondWorst, q) }
-            t += Double(frames) / rate
+            for block in mixer.pull(now: now) where t > 1 && block.samples.contains(0) { zeros += 1 }
+            let lead = abs(mixer.timelineEnd(.game)! - now)
+            worst = max(worst, lead)
+            if t < 5 { early = max(early, lead) }
+            if t > 55 { late = max(late, lead) }
+            t += chunk
         }
-        try expect(worst <= 0.1, "queue reached \(worst) s")
-        try expect(lastSecondWorst <= firstSecondWorst + 0.005, "grew from \(firstSecondWorst) to \(lastSecondWorst)")
+        try expect(worst <= 0.1, "timeline off the host clock by \(worst) s")
+        try expect(late <= early + 0.005, "grew from \(early) to \(late)")
         try expect(zeros <= 2, "\(zeros) blocks with gaps")
-        try expect(pulled > 2000, "pulled \(pulled)")
+    }
+
+    /// Runs a 100 Hz sine through the mixer and counts places where it is not smooth (a held or skipped frame).
+    func discontinuities(chunk: Double, jitter: Double, rateRatio: Double, seconds: Double,
+                         bound: Double? = nil) -> (breaks: Int, worstLead: Double) {
+        var mixer = StreamMixer(startHostTime: start)
+        var rng = SystemRandomNumberGenerator()
+        let frames = Int(chunk * rate)
+        var n = 0, t = 0.0
+        var out: [Float] = []
+        var worst = 0.0
+        while t < seconds {
+            var samples = [Float](repeating: 0, count: frames * 2)
+            for i in 0..<frames {
+                let v = Float(0.5 * sin(2 * Double.pi * 100 * Double(n + i) / rate))
+                samples[i * 2] = v
+                samples[i * 2 + 1] = v
+            }
+            n += frames
+            let host = start + 0.1 + t / rateRatio
+            let j = jitter > 0 ? Double.random(in: -jitter...jitter, using: &rng) : 0
+            mixer.push(.game, samples: samples, hostTime: host + j)
+            out += flat(mixer.pull(now: host + chunk))
+            worst = max(worst, abs(mixer.timelineEnd(.game)! - (host + chunk)))
+            t += chunk
+        }
+        var breaks = 0
+        let from = Int(0.5 * rate)
+        for i in max(from, 2)..<(out.count / 2) {
+            let d2 = out[i * 2] - 2 * out[(i - 1) * 2] + out[(i - 2) * 2]
+            if abs(d2) > 3e-4 { breaks += 1 }
+        }
+        return (breaks, worst)
+    }
+
+    check("an in-sync source with 2 ms jitter in 10 ms buffers is untouched") {
+        let r = discontinuities(chunk: 0.01, jitter: 0.002, rateRatio: 1, seconds: 10)
+        try expect(r.breaks == 0, "\(r.breaks) held or skipped frames")
+    }
+
+    check("an in-sync source with 5 ms jitter in 20 ms buffers is untouched") {
+        let r = discontinuities(chunk: 0.02, jitter: 0.005, rateRatio: 1, seconds: 10)
+        try expect(r.breaks == 0, "\(r.breaks) held or skipped frames")
+    }
+
+    check("a fast source with 2 ms jitter stays bounded and is corrected gently") {
+        let r = discontinuities(chunk: 0.01, jitter: 0.002, rateRatio: 1.001, seconds: 60)
+        try expect(r.worstLead <= 0.1, "lead \(r.worstLead) s")
+        // 0.1% of 60 s is about 2900 frames to remove, each showing as two or so; chasing jitter would be far more.
+        try expect(r.breaks < 6500, "\(r.breaks) corrections")
+    }
+
+    check("non-finite times are ignored") {
+        var mixer = StreamMixer(startHostTime: start)
+        mixer.push(.game, samples: constant(0.5, seconds: 0.1), hostTime: .nan)
+        mixer.push(.game, samples: constant(0.5, seconds: 0.1), hostTime: .infinity)
+        mixer.push(.game, samples: constant(0.5, seconds: 0.1), hostTime: 1e300)
+        try expect(mixer.timelineEnd(.game) == nil, "track created")
+        try expect(mixer.pull(now: .nan).isEmpty, "blocks for NaN")
+        try expect(mixer.pull(now: .infinity).isEmpty, "blocks for infinity")
     }
 
     check("a slow source never starves into repeated gaps") {
@@ -166,16 +218,19 @@ func streamAudioChecks() {
         try expect(flat(mixer.pull(now: start + 0.6)).allSatisfy { $0 == 0 }, "not silent")
     }
 
-    check("sound from before the emitted position is dropped") {
+    check("sound from before the emitted position is dropped, the rest plays") {
         var mixer = StreamMixer(startHostTime: start)
-        _ = mixer.pull(now: start + 1.1) // emitted up to ~1 s
-        mixer.push(.game, samples: constant(0.5, seconds: 0.5), hostTime: start + 0.5)
+        let first = mixer.pull(now: start + 1.1)
+        let emittedEnd = first.last!.hostTime + 1024 / rate - start
+        mixer.push(.game, samples: constant(0.5, seconds: 1), hostTime: start + 0.5) // 0.5 s to 1.5 s
         let blocks = mixer.pull(now: start + 2)
         let mixed = flat(blocks)
-        let sinceFirst = blocks[0].hostTime
-        let audible = mixed.firstIndex { $0 != 0 }
-        // Only the part that reaches past the emitted position (about 1 s) may sound.
-        try expect(audible == nil || Double(audible! / 2) / rate + sinceFirst < start + 1.01, "late part mixed in")
+        let base = blocks[0].hostTime - start
+        func at(_ t: Double) -> Float { mixed[Int((t - base) * rate) * 2] }
+        try expect(at(emittedEnd + 0.01) == 0.5 && at(1.4) == 0.5, "on-time part not audible")
+        try expect(at(1.6) == 0, "sound after its end")
+        let firstAudible = Double(mixed.firstIndex { $0 != 0 }! / 2) / rate + base
+        try expect(firstAudible >= emittedEnd - 1e-9, "late part mixed in at \(firstAudible)")
     }
 
     check("normalizer turns 44.1 kHz mono Int16 into 48 kHz stereo") {
