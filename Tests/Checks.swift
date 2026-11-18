@@ -27,6 +27,7 @@ func expect(_ condition: Bool, _ message: String = "", line: UInt = #line) throw
 /// Each check file adds one entry here.
 private let checkGroups: [() -> Void] = [
     amf0Checks,
+    flvChecks,
 ]
 
 @main
