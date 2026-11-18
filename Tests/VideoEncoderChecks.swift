@@ -79,6 +79,13 @@ private struct Run {
     func fewestFramesPerSecond(seconds: Int) -> Int {
         (0..<seconds).map { k in frames.filter { Int($0.time.seconds) == k }.count }.min() ?? 0
     }
+    /// Longest stretch in seconds without a keyframe: between keyframes, and from the last one to
+    /// the last input frame at `end`.
+    func longestKeyframeGap(end: Double) -> Double {
+        let times = frames.filter(\.keyframe).map(\.time.seconds)
+        guard let last = times.last else { return .infinity }
+        return zip(times, times.dropFirst()).map { $1 - $0 }.reduce(end - last, max)
+    }
     /// Bytes of frames with presentation time under 1 s.
     var firstSecond: Int { frames.filter { $0.time.seconds < 1 }.reduce(0) { $0 + $1.avcc.count } }
     /// Longest runs of consecutive dropped input frames: before an admitted keyframe (where the
@@ -99,9 +106,11 @@ private struct Run {
 
 /// Encodes `count` frames at 60 fps and returns what came out once the encoder has finished.
 /// `forceKeyframe` picks the frames sent with a keyframe request; `sceneEvery` switches to an
-/// unrelated picture and back every that many frames; `warmUp` waits for the first output.
+/// unrelated picture and back every that many frames; `warmUp` waits for the first output;
+/// `time` gives frame `i` its presentation time.
 private func encodeRun(count: Int, bitrate: Int = 6_000_000, noiseShift: UInt32, forceKeyframe: (Int) -> Bool = { _ in false },
-                       sceneEvery: Int? = nil, warmUp: Bool = true) -> Run? {
+                       sceneEvery: Int? = nil, warmUp: Bool = true,
+                       time: (Int) -> CMTime = { CMTime(value: CMTimeValue($0), timescale: 60) }) -> Run? {
     let log = FrameLog()
     guard let encoder = StreamVideoEncoder(width: width, height: height, bitrate: bitrate, frameRate: 60, onFrame: { log.add($0) }) else { return nil }
     let rows = [noiseRow(noiseShift: noiseShift), noiseRow(noiseShift: noiseShift, other: true)]
@@ -111,7 +120,7 @@ private func encodeRun(count: Int, bitrate: Int = 6_000_000, noiseShift: UInt32,
         guard let buffer = movingBuffer(from: row, index: i) else { return nil }
         // Capture arrives every 16 ms; a little pacing keeps the checks short but not a flood.
         Thread.sleep(forTimeInterval: 0.004)
-        accepted.append(encoder.encode(buffer, at: CMTime(value: CMTimeValue(i), timescale: 60), forceKeyframe: forceKeyframe(i)))
+        accepted.append(encoder.encode(buffer, at: time(i), forceKeyframe: forceKeyframe(i)))
         // The first frame's latency is the encoder's warm-up, not steady state: wait it out.
         if i == 0 && warmUp { waitUntil(timeout: 3) { !log.frames.isEmpty } }
     }
@@ -162,13 +171,15 @@ func videoEncoderChecks() {
     check("encoder holds 6 Mbps on busy input, shedding evenly") {
         let run = try encodeRun(count: 300, noiseShift: 28).unwrapped("encoder not created")
         let runs = run.longestDropRuns
-        if report { print("shift 28: worst \(run.worstSecond) total \(run.totalBytes) out \(run.frames.count) drop runs \(runs)") }
+        let gap = run.longestKeyframeGap(end: 299.0 / 60)
+        if report { print("shift 28: worst \(run.worstSecond) total \(run.totalBytes) out \(run.frames.count) drop runs \(runs) keyframe gap \(gap)") }
         try expect(run.totalBytes >= 1_500_000 && run.totalBytes <= 5_000_000, "total \(run.totalBytes) bytes")
         try expect(run.frames.count > 5, "only \(run.frames.count) frames")
         try expect(Double(run.worstSecond) <= 1.3 * 750_000, "worst second \(run.worstSecond) bytes")
         try expect(run.frames.count + run.dropped == 300, "frames \(run.frames.count) + dropped \(run.dropped)")
         try expect(runs.other <= 3, "\(runs.other) frames dropped in a row")
         try expect(runs.keyframe <= 3, "\(runs.keyframe) frames dropped in a row before a keyframe")
+        try expect(gap <= 2.2, "\(gap) s without a keyframe")
     }
 
     // Even shedding is not asserted here: fed at 15 fps (every 4th frame) with no guard, this
@@ -177,11 +188,39 @@ func videoEncoderChecks() {
     check("encoder holds 6 Mbps on very busy input without stalling") {
         let run = try encodeRun(count: 300, noiseShift: 26).unwrapped("encoder not created")
         let fewest = run.fewestFramesPerSecond(seconds: 5)
-        if report { print("shift 26: worst \(run.worstSecond) total \(run.totalBytes) out \(run.frames.count) fewest a second \(fewest) drop runs \(run.longestDropRuns)") }
+        let gap = run.longestKeyframeGap(end: 299.0 / 60)
+        if report { print("shift 26: worst \(run.worstSecond) total \(run.totalBytes) out \(run.frames.count) fewest a second \(fewest) drop runs \(run.longestDropRuns) keyframe gap \(gap)") }
         try expect(run.frames.count > 5, "only \(run.frames.count) frames")
         try expect(Double(run.worstSecond) <= 1.3 * 750_000, "worst second \(run.worstSecond) bytes")
         try expect(run.frames.count + run.dropped == 300, "frames \(run.frames.count) + dropped \(run.dropped)")
         try expect(fewest >= 1, "a second with only \(fewest) frames")
+        // A keyframe here needs most of a second's budget, so it waits for room: measured 2.52 s.
+        try expect(gap <= 2.6, "\(gap) s without a keyframe")
+    }
+
+    // Input the encoder already holds under the target (worst second about 720-735 KB at
+    // shift 29) must not be thinned by the guard's pacing.
+    for (shift, allowed) in [(UInt32(30), 0), (UInt32(29), 6)] {
+        check("encoder keeps every frame of mid-busy input (shift \(shift))") {
+            let run = try encodeRun(count: 300, noiseShift: shift).unwrapped("encoder not created")
+            if report { print("shift \(shift): worst \(run.worstSecond) dropped \(run.dropped)") }
+            try expect(run.dropped <= allowed, "dropped \(run.dropped) frames")
+            try expect(Double(run.worstSecond) <= 1.3 * 750_000, "worst second \(run.worstSecond) bytes")
+        }
+    }
+
+    check("encoder recovers when input time restarts") {
+        // 120 frames from t = 100 s, then 120 from t = 0, frames of the first stretch in flight.
+        let run = try encodeRun(count: 240, noiseShift: 29, time: {
+            CMTime(value: CMTimeValue($0 < 120 ? 6000 + $0 : $0 - 120), timescale: 60)
+        }).unwrapped("encoder not created")
+        let restarted = run.frames.filter { $0.time.seconds < 100 }
+        let keyframes = restarted.filter(\.keyframe).map(\.time.seconds)
+        if report { print("time restart: \(restarted.count) of 120 out, keyframes at \(keyframes)") }
+        try expect(restarted.count >= 115, "only \(restarted.count) of 120 frames after the restart")
+        try expect(keyframes.first.map { $0 <= 0.2 } == true, "no keyframe where time restarted")
+        try expect(zip(keyframes, keyframes.dropFirst()).allSatisfy { $1 - $0 <= 2.2 }
+                   && 119.0 / 60 - (keyframes.last ?? 0) <= 2.2, "keyframes \(keyframes)")
     }
 
     check("encoder holds 6 Mbps with keyframes forced on busy input") {
@@ -320,6 +359,39 @@ func videoEncoderChecks() {
         }
         try expect(done.wait(timeout: .now() + 30) == .success, "timed out")
         try expect(late.frames.isEmpty, "\(late.frames.count) frames from B after its invalidate returned")
+    }
+
+    check("two encoders invalidating each other from onFrame do not deadlock") {
+        let done = DispatchSemaphore(value: 0)
+        let row = noiseRow(noiseShift: 31)
+        DispatchQueue.global().async {
+            for _ in 0..<10 {
+                var a: StreamVideoEncoder?
+                var b: StreamVideoEncoder?
+                let start = DispatchSemaphore(value: 0)
+                // Each holds its delivery open a moment so the two invalidations overlap.
+                a = StreamVideoEncoder(width: width, height: height, bitrate: 6_000_000, frameRate: 60, onFrame: { _ in
+                    _ = start.wait(timeout: .now() + 0.05); Thread.sleep(forTimeInterval: 0.002); b?.invalidate()
+                })
+                b = StreamVideoEncoder(width: width, height: height, bitrate: 6_000_000, frameRate: 60, onFrame: { _ in
+                    start.signal(); Thread.sleep(forTimeInterval: 0.002); a?.invalidate()
+                })
+                let group = DispatchGroup()
+                for encoder in [a, b] {
+                    DispatchQueue.global().async(group: group) {
+                        for i in 0..<20 {
+                            if let buffer = movingBuffer(from: row, index: i) { encoder?.encode(buffer, at: CMTime(value: CMTimeValue(i), timescale: 60)) }
+                        }
+                    }
+                }
+                group.wait()
+                start.signal()
+                a?.invalidate()
+                b?.invalidate()
+            }
+            done.signal()
+        }
+        try expect(done.wait(timeout: .now() + 30) == .success, "timed out")
     }
 
     check("onFrame may invalidate its own encoder") {

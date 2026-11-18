@@ -49,16 +49,18 @@ final class StreamVideoEncoder {
     /// Invariant: a frame is admitted only if the bytes output in the last second of presentation
     /// time, plus every frame in flight costed at the larger of its reservation and the current
     /// estimate for its kind, plus the frame itself (a keyframe with a quarter more), fit the
-    /// target. Estimates are the largest frame of that kind in the last second (a keyframe: the
-    /// last keyframe, never less than a delta), falling back to the largest frame there is. So a
-    /// second goes over only by what frames outgrow their estimates. A lone frame (nothing in the window or in
-    /// flight) is always admitted: a frame bigger than the budget would otherwise stop the stream.
+    /// target. Estimates are the largest of the last 8 deltas in the last second (a keyframe:
+    /// the last keyframe, never less than a delta), falling back to the largest frame there is.
+    /// So a second goes over only by what frames outgrow their estimates. A lone frame (nothing
+    /// in the window or in flight) is always admitted: a frame bigger than the budget would
+    /// otherwise stop the stream.
     ///
     /// The window alone lets a burst through at the start of each second and refuses the rest,
     /// so delta frames are also paced by a credit charged with their actual size. It refills at
     /// the target less a keyframe (one comes every 2 s, so every second is within a second of
-    /// one). The pace yields after three drops in a row, so viewers see a lower frame rate rather
-    /// than a frozen picture; the window never yields, since holding the rate comes first.
+    /// one), and just before a keyframe is due deltas leave it its room. The pace yields after
+    /// three drops in a row, so viewers see a lower frame rate rather than a frozen picture; the
+    /// window never yields, since holding the rate comes first.
     /// Possible later improvement: lower the session's average bitrate while shedding, so the
     /// encoder stops spending the dropped frames' budget on the frames it gets.
     private struct RateGuard {
@@ -66,26 +68,41 @@ final class StreamVideoEncoder {
         /// Seconds after a keyframe when the guard forces the next one, a little before the
         /// encoder's own 2 s limit would, so the kind of every frame is known when it is costed.
         let keyframeInterval: Double
+        /// How long before a keyframe is due deltas start leaving room for it.
+        let lead: Double
+        let frameDuration: Double
         private var window: [(time: Double, bytes: Int, keyframe: Bool)] = []
         private var windowBytes = 0
-        private var inFlight: [(keyframe: Bool, reserved: Int, charged: Double)] = []
+        private var inFlight: [(keyframe: Bool, reserved: Int, charged: Double, epoch: Int)] = []
+        /// Counts input time restarts; frames sent before the last one land outside the window.
+        private var epoch = 0
         private var largestSeen: Int?
         private var lastDeltaBytes = 0
         private var lastKeyframeBytes: Int?
+        /// Time of the last keyframe output in this epoch. Only output counts, so a keyframe
+        /// the encoder loses is asked for again.
         private var lastKeyframeTime: Double?
         private var lastTime: Double?
+        /// Bytes delta frames may still take ahead of the pace.
         private var credit = 0.0
+        private var creditStarted = false
+        /// When the credit started (stream start or time restart).
+        private var creditStart = 0.0
         private var dropsInRow = 0
         /// Set while a keyframe is wanted and not yet handed to the encoder.
         private var keyframePending = false
 
         init(target: Double, frameRate: Int) {
             self.target = target
-            keyframeInterval = 2 - 1.5 / Double(max(frameRate, 1))
+            frameDuration = 1 / Double(max(frameRate, 1))
+            keyframeInterval = 2 - 1.5 * frameDuration
+            lead = 3 * frameDuration
         }
 
         private func cost(keyframe: Bool) -> Int? {
-            let deltas = window.lazy.filter { !$0.keyframe }.map(\.bytes).max()
+            // Recent deltas only: the first ones after a keyframe run large while the encoder
+            // settles, and costing every delta at those for a whole second stalls the stream.
+            let deltas = window.lazy.filter { !$0.keyframe }.suffix(8).map(\.bytes).max()
             let delta = deltas ?? window.lazy.map(\.bytes).max() ?? largestSeen
             guard keyframe else { return delta }
             guard let last = lastKeyframeBytes ?? largestSeen else { return delta }
@@ -96,11 +113,13 @@ final class StreamVideoEncoder {
         /// must be followed by `sent` or `failed`.
         mutating func admit(at time: Double, forceKeyframe: Bool) -> Bool? {
             if let last = lastTime, time < last {
-                // Input time went backwards: the old window says nothing about the new stretch.
+                // Input time went backwards: the old window says nothing about the new stretch,
+                // and frames still in flight from before belong to neither.
                 window.removeAll()
                 windowBytes = 0
                 lastKeyframeTime = nil
-                credit = 0
+                creditStarted = false
+                epoch += 1
             }
             let elapsed = lastTime.map { min(max(time - $0, 0), 1) } ?? 0
             lastTime = time
@@ -108,33 +127,56 @@ final class StreamVideoEncoder {
                 windowBytes -= first.bytes
                 window.removeFirst()
             }
-            if forceKeyframe || lastKeyframeTime.map({ time - $0 >= keyframeInterval }) ?? true {
+            let keyframeInFlight = inFlight.contains { $0.keyframe && $0.epoch == epoch }
+            let sinceKeyframe = lastKeyframeTime.map { time - $0 } ?? .infinity
+            if forceKeyframe || (!keyframeInFlight && sinceKeyframe >= keyframeInterval) {
                 keyframePending = true
             }
             let keyframe = keyframePending
-            // Every second is within a second of a keyframe, so deltas get what one leaves, less
-            // a little so the window itself rarely has to refuse a frame (that is what makes runs).
-            let pace = max(target - Double(cost(keyframe: true) ?? 0), target / 4) * 0.95
-            credit = min(credit + pace * elapsed, pace / 10)
+            // Shortly before one is due, deltas leave the keyframe its room, so it is not held
+            // back for long once due (the 2 s spacing is what the ingest expects).
+            let keyframeNear = !keyframeInFlight && sinceKeyframe >= keyframeInterval - lead
+            // Every second is within a second of a keyframe, so deltas get what one leaves (with
+            // the quarter it may grow by), so the window itself rarely has to refuse a frame:
+            // that is what makes runs. A quarter second of credit absorbs uneven frame sizes, so
+            // input already under the target is not thinned.
+            let keyframeCost = Double(cost(keyframe: true) ?? 0)
+            let pace = max(target - keyframeCost * 1.25, target / 4)
+            // No credit to start with: in the first second nothing leaves the window, which then
+            // has only a quarter keyframe to spare. The encoder's first deltas run large, though,
+            // and dropping them can set it off on a path of larger frames (measured), so early in
+            // that second the credit may be overdrawn by up to six frames, repaid by 0.9 s so the
+            // yields after three drops still fit before the second ends.
+            if !creditStarted { creditStart = time }
+            credit = creditStarted ? min(credit + pace * elapsed, pace / 4) : 0
+            creditStarted = true
+            let overdraft = max(0, 0.9 - (time - creditStart)) / 0.9 * pace * 6 * frameDuration
 
             let lone = window.isEmpty && inFlight.isEmpty
             guard let candidate = cost(keyframe: keyframe) else {
                 // Nothing has come out yet, so no size is known: one frame at a time.
                 guard lone else { return drop() }
-                inFlight.append((keyframe, 0, 0))
+                inFlight.append((keyframe, 0, 0, epoch))
                 dropsInRow = 0
                 return keyframe
             }
             if !lone {
-                if !keyframe && credit < 0 && dropsInRow < 3 { return drop() }
+                if !keyframe && credit < -overdraft && dropsInRow < 3 { return drop() }
                 let pending = inFlight.reduce(0) { $0 + max($1.reserved, cost(keyframe: $1.keyframe) ?? 0) }
                 // A keyframe needs a quarter more room: fed sparsely, the encoder spends what drops
                 // left unused on it (measured: 493 KB after a 368 KB one).
                 let growth = keyframe ? Double(candidate) / 4 : 0
-                if Double(windowBytes + pending + candidate) + growth > target { return drop() }
+                let projected = Double(windowBytes + pending + candidate)
+                if projected + growth > target {
+                    // Credit saved while the window refuses would let a burst through after.
+                    credit = min(credit, 0)
+                    return drop()
+                }
+                // Only while shedding: input that fits has room for the keyframe anyway.
+                if !keyframe && keyframeNear && credit < 0 && projected + keyframeCost > target { return drop() }
             }
             let charge = keyframe ? 0 : Double(lastDeltaBytes)
-            inFlight.append((keyframe, candidate, charge))
+            inFlight.append((keyframe, candidate, charge, epoch))
             credit -= charge
             dropsInRow = 0
             return keyframe
@@ -146,11 +188,8 @@ final class StreamVideoEncoder {
         }
 
         /// The encoder took the frame admitted last.
-        mutating func sent(keyframe: Bool, at time: Double) {
-            if keyframe {
-                keyframePending = false
-                lastKeyframeTime = time
-            }
+        mutating func sent(keyframe: Bool) {
+            if keyframe { keyframePending = false }
         }
 
         /// The encoder refused the frame admitted last; a keyframe request stays pending.
@@ -162,13 +201,15 @@ final class StreamVideoEncoder {
         /// The oldest frame in flight came out (no reordering, so output is in input order).
         mutating func landed(time: Double, bytes: Int, keyframe: Bool) {
             let entry = inFlight.isEmpty ? nil : inFlight.removeFirst()
+            // Sent before input time restarted: its time is not on the new clock.
+            if let entry, entry.epoch != epoch { return }
             window.append((time, bytes, keyframe))
             windowBytes += bytes
             largestSeen = max(largestSeen ?? 0, bytes)
             if keyframe {
                 lastKeyframeBytes = bytes
                 // The encoder may add one of its own; the schedule counts from it.
-                lastKeyframeTime = max(lastKeyframeTime ?? time, time)
+                lastKeyframeTime = time
             } else {
                 // The credit was charged an estimate; settle it at the real size.
                 credit += (entry?.charged ?? 0) - Double(bytes)
@@ -192,6 +233,9 @@ final class StreamVideoEncoder {
         var closed = false
         /// onFrame calls running now; invalidate waits for them.
         var delivering = 0
+        /// Of those, the ones themselves waiting in another encoder's invalidate. Waiting for
+        /// them could close a cycle (two encoders invalidating each other), so nobody does.
+        var blocked = 0
         var dropped = 0
         var rate: RateGuard
         init(onFrame: @escaping (Frame) -> Void, rate: RateGuard) {
@@ -293,13 +337,14 @@ final class StreamVideoEncoder {
             output.dropped += 1
             return false
         }
-        output.rate.sent(keyframe: keyframe, at: time.seconds)
+        output.rate.sent(keyframe: keyframe)
         return true
     }
 
     /// Completes pending frames, then tears the session down. No output follows its return.
     /// Called from an encoder's onFrame, it drops pending frames instead and finishes the
-    /// teardown on another thread.
+    /// teardown on another thread; an onFrame of this encoder that is itself inside an
+    /// invalidate may then still be running.
     func invalidate() {
         let active = Output.activeOnThisThread
         if let active, active.count > 0 {
@@ -308,10 +353,15 @@ final class StreamVideoEncoder {
             // wait for onFrame calls on other threads unless this is one of ours.
             output.lock.lock()
             output.closed = true
-            if !active.contains(output) {
-                while output.delivering > 0 { output.lock.wait() }
-            }
             output.lock.unlock()
+            if !active.contains(output) {
+                let mine = active.allObjects.compactMap { $0 as? Output }
+                for other in mine { other.lock.lock(); other.blocked += 1; other.lock.broadcast(); other.lock.unlock() }
+                output.lock.lock()
+                while output.delivering > output.blocked { output.lock.wait() }
+                output.lock.unlock()
+                for other in mine { other.lock.lock(); other.blocked -= 1; other.lock.unlock() }
+            }
             DispatchQueue.global(qos: .utility).async { self.invalidate() }
             return
         }
