@@ -40,10 +40,23 @@ Needs: a Mac with macOS 14 (Sonoma) or newer. Best on Apple Silicon (M1 or newer
    M     fit / fill / stretch
    P     take a screenshot (saved in Pictures > Clarion)
    R     start / stop recording, with sound (saved in Movies > Clarion)
+   N     microphone on / off while you are live
    ⌘Q    quit
 
 
-5. TIPS
+5. GO LIVE ON YOUTUBE OR TWITCH
+   Press Tab and scroll to Live stream. Turn on YouTube, Twitch or both, paste the stream key
+   from the site, and click Go live. Click End stream to stop. No key on the keyboard starts a stream.
+
+   - Viewers see the picture Clarion shows, with the game sound. You can add your microphone and
+     a small webcam picture in a corner; the webcam is never shown on your own screen.
+   - Set the title and who can watch on YouTube or Twitch itself.
+   - Your stream key is saved on this Mac in a file only your account can read. It is not encrypted.
+   - With a capture card, viewers hear the game only while "Play the capture card's sound" is on.
+   - If the game feels slower while you are live with F on, set In-between frames to Fast.
+
+
+6. TIPS
    - For the least delay, leave F off and connect your PlayStation and Mac by ethernet cable.
    - If the picture freezes in Remote Play mode, move the PS Remote Play window to another screen.
    - If something says access is off: System Settings > Privacy & Security, find the right
