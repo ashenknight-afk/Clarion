@@ -90,7 +90,13 @@ final class CameraFeed: NSObject, ObservableObject, CameraSource {
 
     private static let deviceTypes: [AVCaptureDevice.DeviceType] = [.builtInWideAngleCamera, .external, .continuityCamera]
 
-    override init() {
+    /// Checks only: stands in for the capture session, so the holds logic runs without a camera.
+    private let engine: (begin: (String?) -> Void, end: () -> Void)?
+
+    convenience override init() { self.init(engine: nil) }
+
+    init(engine: (begin: (String?) -> Void, end: () -> Void)?) {
+        self.engine = engine
         previewLayer = AVCaptureVideoPreviewLayer(session: session)
         previewLayer.videoGravity = .resizeAspectFill
         super.init()
@@ -118,6 +124,9 @@ final class CameraFeed: NSObject, ObservableObject, CameraSource {
         return AVCaptureDevice.DiscoverySession(deviceTypes: Self.deviceTypes, mediaType: .video, position: .unspecified).devices
             .filter { $0.uniqueID != excluded }
     }
+
+    /// Checks only: returns once everything asked of the queue so far has run.
+    func waitUntilIdle() { queue.sync {} }
 
     // MARK: - CameraSource
 
@@ -173,6 +182,12 @@ final class CameraFeed: NSObject, ObservableObject, CameraSource {
     }
 
     private func begin(_ request: Request, generation: Int) {
+        if let engine {
+            engagedWith = request
+            engine.begin(request.deviceID)
+            report(.running("Stand-in"))
+            return
+        }
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             break
@@ -202,8 +217,9 @@ final class CameraFeed: NSObject, ObservableObject, CameraSource {
         if let id = request.deviceID {
             device = candidates.first { $0.uniqueID == id }
         } else {
-            // The card is left out already; a plain external camera is the last choice.
-            device = candidates.first { $0.deviceType != .external } ?? candidates.first
+            // Automatic never takes an external device: it could be a capture card the exclusion doesn't know.
+            // External webcams are chosen by name.
+            device = candidates.first { $0.deviceType != .external }
         }
         guard let device else {
             report(.unavailable(request.deviceID == nil ? "No camera" : "Camera"))
@@ -248,6 +264,11 @@ final class CameraFeed: NSObject, ObservableObject, CameraSource {
     }
 
     private func teardown() {
+        if let engine {
+            if engagedWith != nil { engine.end() }
+            engagedWith = nil
+            return
+        }
         for observer in sessionObservers { NotificationCenter.default.removeObserver(observer) }
         sessionObservers = []
         lock.lock()

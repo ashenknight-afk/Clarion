@@ -188,6 +188,8 @@ private final class FakeMic: MicSource {
 private final class FakeCamera: CameraSource {
     let frame = Locked<CVPixelBuffer?>(nil)
     var onState: ((CameraFeed.State) -> Void)?
+    /// What start reports.
+    var startState = CameraFeed.State.running("Stand-in")
     private let started = Locked<[(deviceID: String?, user: CameraUser)]>([])
     private let stopped = Locked<[CameraUser]>([])
     var startCalls: [(deviceID: String?, user: CameraUser)] { started.value }
@@ -197,7 +199,7 @@ private final class FakeCamera: CameraSource {
 
     func start(deviceID: String?, for user: CameraUser) {
         started.update { $0.append((deviceID, user)) }
-        onState?(.running("Stand-in"))
+        onState?(startState)
     }
 
     func stop(for user: CameraUser) { stopped.update { $0.append(user) } }
@@ -893,14 +895,44 @@ func broadcasterChecks() {
     }
 
     check("the preview and the stream each keep the camera running until both let go") {
-        var holds = CameraHolds()
-        try expect(holds.add(.preview), "first user should start the camera")
-        try expect(!holds.add(.stream), "second user shouldn't restart it")
-        try expect(!holds.remove(.preview), "the camera stopped under the stream")
-        try expect(holds.remove(.stream), "the last user leaving should stop it")
-        try expect(holds.add(.stream), "stream alone should start it")
-        try expect(!holds.remove(.preview), "preview never held it")
-        try expect(holds.remove(.stream), "stream should stop it")
-        try expect(!holds.remove(.stream), "nothing left to stop")
+        let begun = Locked<[String?]>([])
+        let ended = Locked(0)
+        let feed = CameraFeed(engine: (begin: { id in begun.update { $0.append(id) } }, end: { ended.update { $0 += 1 } }))
+        feed.start(deviceID: "cam", for: .preview)
+        feed.start(deviceID: "cam", for: .stream)
+        feed.waitUntilIdle()
+        try expect(begun.value == ["cam"], "session started \(begun.value)")
+        feed.stop(for: .preview)
+        feed.waitUntilIdle()
+        try expect(ended.value == 0, "the camera stopped under the stream")
+        feed.stop(for: .stream)
+        feed.waitUntilIdle()
+        try expect(ended.value == 1, "the last user leaving should stop it, stops \(ended.value)")
+        // The other way round, and a stream alone.
+        feed.start(deviceID: "cam", for: .stream)
+        feed.start(deviceID: "cam", for: .preview)
+        feed.stop(for: .stream)
+        feed.waitUntilIdle()
+        try expect(begun.value.count == 2 && ended.value == 1, "ending the stream stopped the preview's camera")
+        feed.stop(for: .preview)
+        feed.stop(for: .preview)
+        feed.waitUntilIdle()
+        try expect(ended.value == 2, "stops \(ended.value)")
+    }
+
+    check("a stream that finds no camera says so, apart from a camera that was lost") {
+        let server = try RTMPTestServer(behaviour: .accept)
+        defer { server.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        let camera = FakeCamera()
+        camera.startState = .unavailable("No camera")
+        broadcaster.cameraSource = camera
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(cameraConfig(port: server.port))
+        try expect(spin(timeout: 3) { broadcaster.notice == "No camera found" }, "notice \(broadcaster.notice ?? "nil")")
+        try expect(broadcaster.states[.twitch] != nil && broadcaster.isLive, "not live")
+        try ends(broadcaster)
     }
 }

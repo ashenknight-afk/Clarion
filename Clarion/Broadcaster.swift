@@ -108,6 +108,8 @@ final class Broadcaster: ObservableObject {
     /// Tells a camera's reports from this stream apart from those of an earlier one.
     private var cameraSession = 0
     private var cameraStarted = false
+    /// The camera ran during this stream, so a later loss is a disconnect rather than none found.
+    private var cameraSeen = false
     /// Completions of `end` calls made while an end was already running.
     private var endCompletions: [() -> Void] = []
 
@@ -314,6 +316,7 @@ final class Broadcaster: ObservableObject {
 
     private func startCamera(_ camera: (deviceID: String?, layout: CameraLayout)?) {
         cameraSession += 1
+        cameraSeen = false
         guard let camera else { return }
         cameraStarted = true
         let session = cameraSession
@@ -337,9 +340,12 @@ final class Broadcaster: ObservableObject {
         guard session == cameraSession else { return }
         switch state {
         case .unavailable:
-            notice = "Camera disconnected"
+            notice = cameraSeen ? "Camera disconnected" : "No camera found"
         case .denied:
             notice = "Clarion isn't allowed to use the camera"
+        case .running:
+            cameraSeen = true
+            return
         default:
             return
         }

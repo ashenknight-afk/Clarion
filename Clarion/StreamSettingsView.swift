@@ -19,6 +19,8 @@ struct StreamSettingsSection: View {
         /// Set when the keychain refused a save or a removal. Never contains the key.
         @Published var keyError: String?
         @Published var micDevices: [CaptureDeviceInfo] = []
+        /// The preview view is on screen in a window.
+        var previewShown = false
     }
 
     @StateObject private var model = Model()
@@ -43,10 +45,9 @@ struct StreamSettingsSection: View {
             camera.refreshDevices()
             model.savedKeys = Dictionary(uniqueKeysWithValues: StreamSite.allCases.map { ($0, StreamKeychain.hasKey(for: $0)) })
         }
-        .onAppear { updatePreview() }
-        .onDisappear { camera.stop(for: .preview) }
-        .onChange(of: settings.cameraEnabled) { _, _ in updatePreview() }
-        .onChange(of: settings.cameraDeviceID) { _, _ in updatePreview() }
+        .onChange(of: settings.cameraDeviceID) { _, _ in
+            if model.previewShown { camera.start(deviceID: settings.cameraDeviceID, for: .preview) }
+        }
         .onChange(of: settings.cameraLayout) { _, layout in broadcaster.setCameraLayout(layout) }
         .onChange(of: focusedKey) { previous, _ in
             if let previous { saveKey(previous) }
@@ -191,19 +192,12 @@ struct StreamSettingsSection: View {
                 Text("Medium").tag(StreamCameraSize.medium)
                 Text("Large").tag(StreamCameraSize.large)
             }
-            CameraPreview(camera: camera)
+            CameraPreview(camera: camera) { shown in
+                model.previewShown = shown
+                if shown { camera.start(deviceID: settings.cameraDeviceID, for: .preview) } else { camera.stop(for: .preview) }
+            }
                 .frame(width: 160, height: 90)
             if let line = cameraLine { Text(line).font(.callout).foregroundStyle(cameraNeedsAttention ? .yellow : .secondary) }
-        }
-    }
-
-    /// The preview runs only while this section is open and the camera is on. The stream holds the camera
-    /// separately, so closing Settings never stops a camera that is live.
-    private func updatePreview() {
-        if settings.cameraEnabled {
-            camera.start(deviceID: settings.cameraDeviceID, for: .preview)
-        } else {
-            camera.stop(for: .preview)
         }
     }
 
@@ -299,9 +293,14 @@ struct StreamSettingsSection: View {
 /// The camera's own layer at 160×90. The only place the camera shows on this Mac's screen.
 private struct CameraPreview: NSViewRepresentable {
     let camera: CameraFeed
+    /// Called when the view enters or leaves a window. The camera runs for the preview only while it is
+    /// on screen, so closing Settings stops it, and scrolling other rows never does. The stream holds it separately.
+    let onVisible: (Bool) -> Void
 
     final class HostView: NSView {
         let preview: AVCaptureVideoPreviewLayer
+        var onVisible: (Bool) -> Void = { _ in }
+        private var shown = false
         init(_ layer: AVCaptureVideoPreviewLayer) {
             preview = layer
             super.init(frame: .zero)
@@ -312,13 +311,27 @@ private struct CameraPreview: NSViewRepresentable {
             self.layer?.addSublayer(layer)
         }
         required init?(coder: NSCoder) { nil }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            setShown(window != nil)
+        }
+        func setShown(_ nowShown: Bool) {
+            guard nowShown != shown else { return }
+            shown = nowShown
+            onVisible(nowShown)
+        }
         override func layout() {
             super.layout()
             preview.frame = bounds
         }
     }
 
-    func makeNSView(context: Context) -> HostView { HostView(camera.previewLayer) }
-    func updateNSView(_ view: HostView, context: Context) {}
+    func makeNSView(context: Context) -> HostView {
+        let view = HostView(camera.previewLayer)
+        view.onVisible = onVisible
+        return view
+    }
+    func updateNSView(_ view: HostView, context: Context) { view.onVisible = onVisible }
+    static func dismantleNSView(_ view: HostView, coordinator: ()) { view.setShown(false) }
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: HostView, context: Context) -> CGSize? { CGSize(width: 160, height: 90) }
 }
