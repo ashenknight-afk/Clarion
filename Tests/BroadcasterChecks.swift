@@ -616,6 +616,20 @@ func broadcasterChecks() {
         try ends(broadcaster)
     }
 
+    check("a notice clears itself, and an older timer does not clear a newer notice") {
+        let broadcaster = Broadcaster(device: device, library: library)
+        broadcaster.noticeDuration = 0.4
+        broadcaster.goLive(StreamConfig(sites: [], gameVolume: 1, camera: nil, mic: nil))
+        try expect(broadcaster.notice != nil, "no notice")
+        spin(timeout: 0.25)
+        broadcaster.goLive(oneSite(port: 1935, key: " "))
+        try expect(broadcaster.notice == "Add a Twitch stream key in Settings", "notice \(broadcaster.notice ?? "nil")")
+        // The first notice's timer fires at 0.4 s, 0.15 s from here; the second one's at 0.65 s.
+        spin(timeout: 0.3)
+        try expect(broadcaster.notice == "Add a Twitch stream key in Settings", "older timer cleared it: \(broadcaster.notice ?? "nil")")
+        try expect(spin(timeout: 1) { broadcaster.notice == nil }, "notice did not clear")
+    }
+
     check("sites that can't start end the stream with a notice") {
         let broadcaster = Broadcaster(device: device, library: library)
         guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }

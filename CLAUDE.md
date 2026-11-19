@@ -46,7 +46,7 @@ dependencies, no drivers, sandboxed. macOS 14+, Apple Silicon first, Intel must 
 - The live stream (`Broadcaster`) runs on its own queue: nothing of it on the capture thread or `presentQueue`. It takes
   frames through the same `setFrameSink` as the recorder; the sink is unset when neither wants frames.
 - While live, the stats overlay is drawn on a copy (`sharesFrames`), so it can be in a recording and never in the stream.
-- Hardware H.264 encoder only, no software fallback. It ignores bitrate caps on this Mac; the broadcaster holds the
+- Hardware H.264 encoder only, no software fallback. It ignored bitrate caps on an M3; the broadcaster holds the
   bitrate by skipping frames.
 - Stream keys live only in the keychain: never in UserDefaults, logs or error text.
 - The LIVE badge goes through `updateOverlayVisibility` like the other badges: the overlay view stays hidden when

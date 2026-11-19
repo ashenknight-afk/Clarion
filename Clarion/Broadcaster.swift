@@ -65,7 +65,12 @@ final class Broadcaster: ObservableObject {
 
     @Published private(set) var states: [StreamSite: SiteState] = Dictionary(uniqueKeysWithValues: StreamSite.allCases.map { ($0, .off) })
     @Published private(set) var startedAt: Date?
-    @Published private(set) var notice: String?
+    @Published private(set) var notice: String? {
+        didSet { noticeChanged() }
+    }
+    /// How long a notice stays up. Checks only: shortened.
+    var noticeDuration = 6.0
+    private var noticeSerial = 0
     /// Bitrate sent and canvas per site, shown next to its state.
     @Published private(set) var info: [StreamSite: String] = [:]
     @Published private(set) var micMuted = false
@@ -261,6 +266,18 @@ final class Broadcaster: ObservableObject {
 
     private func show(_ text: String) {
         notice = text
+    }
+
+    /// A notice clears itself, so the overlay is not kept on screen by a message nobody needs any more.
+    /// A newer notice restarts the time; the serial stops an older timer clearing it.
+    private func noticeChanged() {
+        noticeSerial += 1
+        guard notice != nil else { return }
+        let serial = noticeSerial
+        DispatchQueue.main.asyncAfter(deadline: .now() + noticeDuration) { [weak self] in
+            guard let self, self.noticeSerial == serial else { return }
+            self.notice = nil
+        }
     }
 
     /// Releases the frame sink and the sound at once; the stream itself closes after.

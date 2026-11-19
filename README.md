@@ -97,14 +97,15 @@ that appears at the top of your screen with the time on air.
 The webcam is off by default. When on, it is a corner picture in the stream only (four corners,
 three sizes), with a small preview in Settings. It never appears over the game on your own screen.
 
-The microphone is mixed with the game sound and has its own volume. **N** mutes and unmutes it, and
+The microphone is mixed with the game sound and has its own volume. N mutes and unmutes it, and
 the badge says MIC OFF while it is muted. "Remove game sound from the microphone" is for when the
 game plays from the Mac's speakers, so it doesn't come back through the microphone. macOS lowers
 other sound a little while it is on. With headphones, turn it off.
 
 If a connection drops, Clarion retries five times, after 1, 2, 4, 8 and 16 seconds. Then that site
-stops and says why, and the other one carries on. A site that refuses the stream, because the key
-is wrong or it is already live, is not retried. When the connection is too slow, video is dropped
+stops and says why, and the other one carries on. Retries are for a connection that drops after the stream has started. A site that refuses the
+stream, because the key is wrong or it is already live, is not retried, and neither is one whose
+first connection fails. When the connection is too slow, video is dropped
 up to the next keyframe, sound keeps going, and the site's line in Settings says "Connection too
 slow".
 
@@ -114,7 +115,7 @@ Limits:
 - The stream shows what Clarion shows. If its window is hidden, viewers see the last picture.
 - The upload has to carry both bitrates added together.
 - Twitch viewers get 1080p at most.
-- There is no software encoder. This Mac's hardware encoder ignores bitrate caps, so in very busy
+- There is no software encoder. On an M3 the hardware encoder ignored bitrate caps, so in very busy
   scenes Clarion holds the bitrate by skipping frames.
 
 This has been tested against a local RTMP server. It has not been through a long stream to the real

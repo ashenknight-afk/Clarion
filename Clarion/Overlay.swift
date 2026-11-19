@@ -175,15 +175,19 @@ struct LiveBadge: View {
     var body: some View {
         VStack(spacing: 8) {
             if broadcaster.isLive {
-                // The timeline exists only while live, so nothing ticks otherwise.
-                TimelineView(.periodic(from: broadcaster.startedAt ?? Date(), by: 1)) { context in
-                    let seconds = max(0, Int(context.date.timeIntervalSince(broadcaster.startedAt ?? context.date)))
-                    HStack(spacing: 8) {
-                        Circle().fill(.red).frame(width: 10, height: 10)
-                        Text(Self.elapsed(seconds))
+                if let start = broadcaster.startedAt {
+                    // The timeline exists only once a site is live, so nothing ticks otherwise.
+                    TimelineView(.periodic(from: start, by: 1)) { context in
+                        let seconds = max(0, Int(context.date.timeIntervalSince(start)))
+                        HStack(spacing: 8) {
+                            Circle().fill(.red).frame(width: 10, height: 10)
+                            Text(Self.elapsed(seconds))
+                        }
                     }
+                    .modifier(RecorderBadge.BadgeStyle())
+                } else {
+                    Text("CONNECTING").modifier(RecorderBadge.BadgeStyle())
                 }
-                .modifier(RecorderBadge.BadgeStyle())
                 if broadcaster.micMuted {
                     Text("MIC OFF").modifier(RecorderBadge.BadgeStyle())
                 }
@@ -208,7 +212,7 @@ struct VideoOverlayRoot: View {
     @ObservedObject var ui: UIState
     @ObservedObject var stats: StatsModel
     @ObservedObject var recorder: Recorder
-    @ObservedObject var broadcaster: Broadcaster
+    let broadcaster: Broadcaster
     let capture: CaptureManager
     let windowCapture: WindowCaptureManager
     let audio: AudioPassthrough
@@ -226,18 +230,16 @@ struct VideoOverlayRoot: View {
                     .padding(24)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
-            if recorder.isRecording || recorder.notice != nil || broadcaster.isLive || broadcaster.notice != nil {
-                VStack(spacing: 8) {
-                    if recorder.isRecording || recorder.notice != nil {
-                        RecorderBadge(recorder: recorder)
-                    }
-                    if broadcaster.isLive || broadcaster.notice != nil {
-                        LiveBadge(broadcaster: broadcaster)
-                    }
+            // The live badge watches the broadcaster itself and is empty when not live, so this view's
+            // body isn't redrawn for every broadcaster update.
+            VStack(spacing: 8) {
+                if recorder.isRecording || recorder.notice != nil {
+                    RecorderBadge(recorder: recorder)
                 }
-                .padding(24)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                LiveBadge(broadcaster: broadcaster)
             }
+            .padding(24)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             if ui.showSettings {
                 SettingsView(settings: settings, recorder: recorder, broadcaster: broadcaster, capture: capture, windowCapture: windowCapture, audio: audio, displays: displays,
                              supportsMetalFX: supportsMetalFX, supportsFrameGeneration: supportsFrameGeneration) {
