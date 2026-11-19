@@ -24,6 +24,7 @@ builds compile and have never been run. Expect rough edges.
   newer). Details and costs below.
 - **Screenshots and recording** of the enhanced picture with the game's sound, with or without the
   stats.
+- **Live streaming** to Twitch and YouTube, with microphone and webcam. See Going live.
 - **A latency test** for measuring the whole chain with a phone camera.
 
 ## Requirements
@@ -70,7 +71,54 @@ streaming app.
 | A | Capture-card audio |
 | P | Screenshot (Pictures → Clarion) |
 | R | Start / stop recording (Movies → Clarion) |
+| N | Mute / unmute the microphone while live |
 | L | Latency test |
+
+## Going live
+
+Clarion can stream what it shows to Twitch and YouTube, with the game's sound, your microphone and
+a webcam. It uses the Mac's hardware H.264 encoder and nothing else. No key starts a stream: open
+Settings (Tab), find Live stream and press Go live.
+
+Type each site's stream key into Settings. Keys are kept in the login keychain, not in a file. Set
+the title and who can watch on the site itself.
+
+- Twitch gets 1080p60 at 6,000 kbps, sent to `rtmps://live.twitch.tv/app`.
+- YouTube gets 1080p, 1440p (the default) or 2160p at 9,000, 18,000 or 35,000 kbps, sent to
+  `rtmps://a.rtmps.youtube.com/live2`.
+- The server address and bitrate can be changed under Advanced.
+- Both sites can be live at once. Each gets its own encoder unless they share a size and bitrate.
+- Sound is AAC, 160 kbps, 48 kHz stereo.
+
+The stream is a constant 60 fps on a 16:9 canvas. The picture is the one Clarion shows, upscaling
+and sharpening included. The stats overlay is never in the stream, and neither is the LIVE badge
+that appears at the top of your screen with the time on air.
+
+The webcam is off by default. When on, it is a corner picture in the stream only (four corners,
+three sizes), with a small preview in Settings. It never appears over the game on your own screen.
+
+The microphone is mixed with the game sound and has its own volume. **N** mutes and unmutes it, and
+the badge says MIC OFF while it is muted. "Remove game sound from the microphone" is for when the
+game plays from the Mac's speakers, so it doesn't come back through the microphone. macOS lowers
+other sound a little while it is on. With headphones, turn it off.
+
+If a connection drops, Clarion retries five times, after 1, 2, 4, 8 and 16 seconds. Then that site
+stops and says why, and the other one carries on. A site that refuses the stream, because the key
+is wrong or it is already live, is not retried. When the connection is too slow, video is dropped
+up to the next keyframe, sound keeps going, and the site's line in Settings says "Connection too
+slow".
+
+Limits:
+
+- With a capture card, the game's sound reaches the stream only while audio passthrough is on.
+- The stream shows what Clarion shows. If its window is hidden, viewers see the last picture.
+- The upload has to carry both bitrates added together.
+- Twitch viewers get 1080p at most.
+- There is no software encoder. This Mac's hardware encoder ignores bitrate caps, so in very busy
+  scenes Clarion holds the bitrate by skipping frames.
+
+This has been tested against a local RTMP server. It has not been through a long stream to the real
+Twitch or YouTube yet.
 
 ## Frame generation
 
@@ -127,6 +175,7 @@ so it asks again after each rebuild unless you set a signing team in Xcode.
 - Frame generation is 2× only, and its in-between frames are made at 720p or 1080p.
 - No HDR. Sources are treated as 8-bit SDR.
 - Streaming apps add their own delay, usually more than Clarion's. A capture card avoids it.
+- Going live is untested on real servers, and the added delay while live has not been measured.
 
 ## License
 

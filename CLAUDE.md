@@ -43,8 +43,18 @@ dependencies, no drivers, sandboxed. macOS 14+, Apple Silicon first, Intel must 
 - When nothing needs it, keep the single-pass path (conversion straight into the drawable). Extra passes only for upscale/sharpen.
 - Screenshots and recording (`Recorder`) get frames through `Renderer.setFrameSink`. The sink is set only while one of
   them wants frames; the picture is then drawn into a BGRA buffer and copied to the drawable (one extra pass). Never leave it set.
+- The live stream (`Broadcaster`) runs on its own queue: nothing of it on the capture thread or `presentQueue`. It takes
+  frames through the same `setFrameSink` as the recorder; the sink is unset when neither wants frames.
+- While live, the stats overlay is drawn on a copy (`sharesFrames`), so it can be in a recording and never in the stream.
+- Hardware H.264 encoder only, no software fallback. It ignores bitrate caps on this Mac; the broadcaster holds the
+  bitrate by skipping frames.
+- Stream keys live only in the keychain: never in UserDefaults, logs or error text.
+- The LIVE badge goes through `updateOverlayVisibility` like the other badges: the overlay view stays hidden when
+  nothing is shown. Its timer exists only while live.
 - Frame generation APIs are macOS 26+: keep them behind `#available` (the interpolator is stored untyped in Renderer) and hide the toggle when unsupported.
 
 ## Checking changes without Xcode
 Type-check: `swiftc -typecheck -parse-as-library -swift-version 5 -sdk $(xcrun --show-sdk-path) -target arm64-apple-macos14.0 Clarion/*.swift`
 (repeat with `x86_64-apple-macos14.0` for Intel). Shaders can be checked with `MTLDevice.makeLibrary(source:)`.
+Stream checks: `scripts/check-stream.sh` must print `all checks passed`. Settings view state lives in an ObservableObject,
+not `@State`, because plain swiftc can't type-check `@State` with this SDK.

@@ -300,6 +300,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.updateSharing() }
             .store(in: &cancellables)
+
+        // The LIVE badge counts as something shown over the video.
+        if let broadcaster {
+            broadcaster.$states.map { _ in () }
+                .merge(with: broadcaster.$notice.map { _ in () })
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] in self?.updateOverlayVisibility() }
+                .store(in: &cancellables)
+        }
     }
 
     private func placeWindow() {
@@ -328,6 +337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateOverlayVisibility() {
         windowController?.overlayVisible = settings.showOverlay || ui.showSettings || stats.statusMessage != nil
             || recorder.isRecording || recorder.notice != nil
+            || broadcaster?.isLive == true || broadcaster?.notice != nil
     }
 
     // MARK: - Hotkeys

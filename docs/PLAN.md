@@ -17,6 +17,10 @@ streaming app ─▶ ScreenCaptureKit window capture (420v, 16:9 crop of the win
 Without frame generation each frame renders on the capture thread the moment it arrives. At most
 one frame is in flight; if the GPU is still busy, the new frame is dropped, not queued.
 
+While live, the finished picture also goes to the stream: the renderer hands the frame to the broadcaster
+through the frame sink, and the broadcaster composes, encodes (hardware H.264) and sends it from its own
+queue at a constant 60 fps. The capture thread and `presentQueue` do none of that work.
+
 With frame generation the capture thread only queues GPU work. A separate queue presents the
 generated frame, then the real one a refresh later, from three drawables.
 
@@ -30,6 +34,10 @@ generated frame, then the real one a refresh later, from three drawables.
 6. Latency test, universal build script.
 7. Window capture for streaming apps.
 8. Screenshots and recording of the enhanced picture with the source's sound.
+9. Live stream to Twitch and YouTube over RTMPS, with the game's sound, a microphone and a corner webcam.
+   Reconnects on its own. A LIVE badge on the owner's screen, never in the stream. Checked against a local
+   RTMP server (`scripts/check-stream.sh`). The delays while live have not been measured yet, nor a stream
+   of an hour, nor a stream to the real sites.
 
 ## Looked at and not built
 
