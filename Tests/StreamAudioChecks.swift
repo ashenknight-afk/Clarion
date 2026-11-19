@@ -302,4 +302,51 @@ func streamAudioChecks() {
         }
         try expect(frames >= 98, "frames \(frames)")
     }
+
+    check("AAC frames decode with the 11 90 config back to the tone") {
+        guard let encoder = StreamAudioEncoder(),
+              let aac = AVAudioFormat(settings: [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48_000,
+                                                 AVNumberOfChannelsKey: 2]),
+              let pcm = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 2, interleaved: false),
+              let decoder = AVAudioConverter(from: aac, to: pcm) else { throw CheckFailure(description: "no codec") }
+        // What the sites get in the AAC sequence header, after its two FLV bytes.
+        decoder.magicCookie = FLV.aacSequenceHeader().dropFirst(2)
+        var left: [Float] = []
+        for n in 0..<60 {
+            var block = [Float](repeating: 0, count: 2048)
+            for i in 0..<1024 {
+                let v = Float(0.3 * sin(2 * Double.pi * 440 * Double(n * 1024 + i) / rate))
+                block[i * 2] = v
+                block[i * 2 + 1] = v
+            }
+            guard let packet = encoder.encode(block), !packet.isEmpty else { continue }
+            let input = AVAudioCompressedBuffer(format: aac, packetCapacity: 1, maximumPacketSize: packet.count)
+            packet.copyBytes(to: input.data.assumingMemoryBound(to: UInt8.self), count: packet.count)
+            input.byteLength = UInt32(packet.count)
+            input.packetCount = 1
+            input.packetDescriptions?[0] = AudioStreamPacketDescription(mStartOffset: 0, mVariableFramesInPacket: 0,
+                                                                        mDataByteSize: UInt32(packet.count))
+            guard let output = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: 1024) else { continue }
+            var given = false
+            var error: NSError?
+            let status = decoder.convert(to: output, error: &error) { _, inputStatus in
+                if given { inputStatus.pointee = .noDataNow; return nil }
+                given = true
+                inputStatus.pointee = .haveData
+                return input
+            }
+            try expect(status != .error && error == nil, "decode failed: \(String(describing: error))")
+            left += UnsafeBufferPointer(start: output.floatChannelData![0], count: Int(output.frameLength))
+        }
+        try expect(left.count >= 50 * 1024, "only \(left.count) frames decoded")
+        // Past the codec's priming: the tone's strength at 440 Hz, as an amplitude.
+        let tail = left.suffix(30 * 1024)
+        var real = 0.0, imaginary = 0.0
+        for (i, value) in tail.enumerated() {
+            real += Double(value) * cos(2 * Double.pi * 440 * Double(i) / rate)
+            imaginary += Double(value) * sin(2 * Double.pi * 440 * Double(i) / rate)
+        }
+        let level = 2 * (real * real + imaginary * imaginary).squareRoot() / Double(tail.count)
+        try expect(level > 0.2, "tone level \(level)")
+    }
 }

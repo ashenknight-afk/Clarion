@@ -198,13 +198,14 @@ func videoEncoderChecks() {
         try expect(gap <= 2.6, "\(gap) s without a keyframe")
     }
 
-    // Input the encoder already holds under the target (worst second about 720-735 KB at
-    // shift 29) must not be thinned by the guard's pacing.
-    for (shift, allowed) in [(UInt32(30), 0), (UInt32(29), 10)] {
-        check("encoder keeps every frame of mid-busy input (shift \(shift))") {
+    // Input close to the target must not be thinned by the guard's pacing. At shift 30 the
+    // encoder stays under the target throughout. At shift 29 it settles at about 720-735 KB a
+    // second, but its first second runs over while it settles, so the guard drops a few frames there.
+    for (shift, fewest) in [(UInt32(30), 300), (UInt32(29), 290)] {
+        check("encoder keeps nearly every frame of mid-busy input (shift \(shift))") {
             let run = try encodeRun(count: 300, noiseShift: shift).unwrapped("encoder not created")
-            if report { print("shift \(shift): worst \(run.worstSecond) dropped \(run.dropped)") }
-            try expect(run.dropped <= allowed, "dropped \(run.dropped) frames")
+            if report { print("shift \(shift): worst \(run.worstSecond) out \(run.frames.count)") }
+            try expect(run.frames.count >= fewest, "\(run.frames.count) of 300 frames out")
             try expect(Double(run.worstSecond) <= 1.3 * 750_000, "worst second \(run.worstSecond) bytes")
         }
     }
@@ -242,6 +243,87 @@ func videoEncoderChecks() {
         if report { print("start-up: first second \(run.firstSecond) out \(run.frames.count)") }
         try expect(Double(run.firstSecond) <= 1.3 * 750_000, "first second \(run.firstSecond) bytes")
         try expect(run.frames.first?.keyframe == true, "first frame is not a keyframe")
+    }
+
+    check("a session lost underneath is rebuilt, and frames come out again starting with a keyframe") {
+        let log = FrameLog()
+        let encoder = try StreamVideoEncoder(width: width, height: height, bitrate: 6_000_000, frameRate: 60,
+                                             onFrame: { log.add($0) }).unwrapped("encoder not created")
+        let row = noiseRow(noiseShift: 31)
+        for i in 0..<120 {
+            let buffer = try movingBuffer(from: row, index: i).unwrapped("no buffer")
+            if i == 60 {
+                waitUntil(timeout: 3) { log.frames.count >= 55 }
+                // As after sleep and wake, or when VideoToolbox's encoder service crashes.
+                encoder.breakSessionForChecks()
+            }
+            Thread.sleep(forTimeInterval: 0.004)
+            encoder.encode(buffer, at: CMTime(value: CMTimeValue(i), timescale: 60))
+            if i == 0 { waitUntil(timeout: 3) { !log.frames.isEmpty } }
+        }
+        waitUntil(timeout: 3) { log.frames.last.map { $0.time.value >= 119 } ?? false }
+        encoder.invalidate()
+        let after = log.frames.filter { $0.time.value >= 60 }
+        try expect(after.count >= 55, "only \(after.count) of 60 frames after the session was lost")
+        try expect(after.first?.keyframe == true && after.first?.sps != nil, "the first frame after the rebuild is not a keyframe")
+        try expect(!encoder.hasFailed, "gave up")
+    }
+
+    check("an encoder whose rebuilds keep failing gives up after the recovery limit") {
+        let log = FrameLog()
+        let encoder = try StreamVideoEncoder(width: width, height: height, bitrate: 6_000_000, frameRate: 60,
+                                             onFrame: { log.add($0) }).unwrapped("encoder not created")
+        // Limit 0.5 s, a rebuild at most every 0.1 s.
+        encoder.recoveryTimeScale = 0.05
+        encoder.refusesRebuildForChecks = true
+        let row = noiseRow(noiseShift: 31)
+        let buffer = try movingBuffer(from: row, index: 0).unwrapped("no buffer")
+        try expect(encoder.encode(buffer, at: .zero), "first frame refused")
+        waitUntil(timeout: 3) { !log.frames.isEmpty }
+        encoder.breakSessionForChecks()
+        let start = Date()
+        var i = 1
+        while !encoder.hasFailed && Date().timeIntervalSince(start) < 3 {
+            encoder.encode(buffer, at: CMTime(value: CMTimeValue(i), timescale: 60))
+            i += 1
+            Thread.sleep(forTimeInterval: 0.016)
+        }
+        let took = Date().timeIntervalSince(start)
+        try expect(encoder.hasFailed, "never gave up")
+        try expect(took >= 0.45 && took < 1.5, "gave up after \(took) s")
+        try expect(!encoder.encode(buffer, at: CMTime(value: CMTimeValue(i), timescale: 60)), "took a frame after giving up")
+        encoder.invalidate()
+    }
+
+    check("the SPS from the FLV AVC record describes a 1920x1080 BT.709 stream") {
+        let run = try encodeRun(count: 10, noiseShift: 31).unwrapped("encoder not created")
+        guard let first = run.frames.first, let sps = first.sps, let pps = first.pps else {
+            throw CheckFailure(description: "no parameter sets")
+        }
+        // Read back out of the record the sites get, as their ingest does.
+        let record = [UInt8](FLV.avcSequenceHeader(sps: sps, pps: pps))
+        try expect(record.count > 16 && record[10] == 0xE1, "record \(record.prefix(16))")
+        let spsLength = Int(record[11]) << 8 | Int(record[12])
+        let ppsStart = 13 + spsLength + 3
+        try expect(record.count >= ppsStart && record[13 + spsLength] == 1, "one PPS expected")
+        let ppsLength = Int(record[ppsStart - 2]) << 8 | Int(record[ppsStart - 1])
+        let sets = [Array(record[13..<13 + spsLength]), Array(record[ppsStart..<ppsStart + ppsLength])]
+        var format: CMFormatDescription?
+        let status = sets[0].withUnsafeBufferPointer { a in
+            sets[1].withUnsafeBufferPointer { b in
+                CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                    allocator: nil, parameterSetCount: 2, parameterSetPointers: [a.baseAddress!, b.baseAddress!],
+                    parameterSetSizes: [a.count, b.count], nalUnitHeaderLength: 4, formatDescriptionOut: &format)
+            }
+        }
+        guard status == noErr, let format else { throw CheckFailure(description: "no format description: \(status)") }
+        let size = CMVideoFormatDescriptionGetDimensions(format)
+        try expect(size.width == 1920 && size.height == 1080, "\(size.width)x\(size.height)")
+        let extensions = CMFormatDescriptionGetExtensions(format) as? [String: Any] ?? [:]
+        for key in [kCMFormatDescriptionExtension_ColorPrimaries, kCMFormatDescriptionExtension_TransferFunction,
+                    kCMFormatDescriptionExtension_YCbCrMatrix] {
+            try expect(extensions[key as String] as? String == "ITU_R_709_2", "\(key): \(extensions[key as String] ?? "none")")
+        }
     }
 
     check("encode after invalidate does nothing") {

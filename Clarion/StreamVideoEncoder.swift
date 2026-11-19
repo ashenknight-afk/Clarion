@@ -222,6 +222,14 @@ final class StreamVideoEncoder {
             guard !inFlight.isEmpty else { return }
             credit += inFlight.removeFirst().charged
         }
+
+        /// The session was replaced: what was in flight in the old one never comes out, and the new
+        /// one starts with a keyframe.
+        mutating func restart() {
+            for entry in inFlight { credit += entry.charged }
+            inFlight.removeAll()
+            keyframePending = true
+        }
     }
 
     /// State the session's callback shares with the encoder. The callback holds this, never the
@@ -238,6 +246,17 @@ final class StreamVideoEncoder {
         var blocked = 0
         var dropped = 0
         var rate: RateGuard
+        /// Counts session rebuilds; output from an older session is ignored.
+        var generation = 0
+        /// Frames handed to the current session that haven't come back.
+        var pending = 0
+        /// Since when a pending frame has been waiting for output (refreshed by each output).
+        var waitingSince: Double?
+        var failuresInRow = 0
+        /// VideoToolbox said the session is gone (sleep/wake, its service crashed, a media reset).
+        var sessionLost = false
+        /// When the session first looked broken; cleared by the next frame that comes out.
+        var brokenSince: Double?
         init(onFrame: @escaping (Frame) -> Void, rate: RateGuard) {
             self.onFrame = onFrame
             self.rate = rate
@@ -253,6 +272,39 @@ final class StreamVideoEncoder {
     private let lock = NSLock()
     private var session: VTCompressionSession?
     private let output: Output
+    private let width: Int
+    private let height: Int
+    private let bitrate: Int
+    private let frameRate: Int
+    /// Lock: when the next rebuild may be tried, and whether recovery has given up.
+    private var nextRebuild = 0.0
+    private var gaveUp = false
+
+    /// A broken session is rebuilt at most this often...
+    static let rebuildInterval = 2.0
+    /// ...and given up on when it hasn't produced a frame again for this long.
+    static let recoveryLimit = 10.0
+    /// Failed encodes in a row that count as a broken session.
+    static let failureLimit = 30
+    /// Checks only: scales the recovery's times.
+    var recoveryTimeScale = 1.0
+    /// Checks only: sessions made for a rebuild fail.
+    var refusesRebuildForChecks = false
+
+    /// True once the session broke and rebuilding it hasn't brought frames back within
+    /// `recoveryLimit`. The encoder then takes no more frames.
+    var hasFailed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return gaveUp
+    }
+
+    /// Checks only: tears the session down underneath the encoder, as a crashed encoder service would.
+    func breakSessionForChecks() {
+        lock.lock()
+        defer { lock.unlock() }
+        if let session { VTCompressionSessionInvalidate(session) }
+    }
 
     /// Frames not encoded: refused by the session, failed or empty in the callback, or dropped
     /// by the rate guard.
@@ -263,9 +315,19 @@ final class StreamVideoEncoder {
     }
 
     init?(width: Int, height: Int, bitrate: Int, frameRate: Int, onFrame: @escaping (Frame) -> Void) {
-        guard let session = Self.makeSession(width: width, height: height) else { return nil }
+        guard let session = Self.configuredSession(width: width, height: height, bitrate: bitrate, frameRate: frameRate) else {
+            return nil
+        }
         output = Output(onFrame: onFrame, rate: RateGuard(target: Double(bitrate) / 8, frameRate: frameRate))
+        self.width = width
+        self.height = height
+        self.bitrate = bitrate
+        self.frameRate = frameRate
+        self.session = session
+    }
 
+    private static func configuredSession(width: Int, height: Int, bitrate: Int, frameRate: Int) -> VTCompressionSession? {
+        guard let session = makeSession(width: width, height: height) else { return nil }
         func set(_ key: CFString, _ value: Any) -> Bool {
             VTSessionSetProperty(session, key: key, value: value as CFTypeRef) == noErr
         }
@@ -281,11 +343,15 @@ final class StreamVideoEncoder {
         _ = set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, 2)
         // Bytes per second: 1.2x the average, over a 1 s window.
         _ = set(kVTCompressionPropertyKey_DataRateLimits, [Double(bitrate) * 1.2 / 8, 1.0])
+        // BT.709 for the conversion from BGRA and in the SPS, so the sites' transcoders don't guess.
+        _ = set(kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2)
+        _ = set(kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2)
+        _ = set(kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2)
         guard required, VTCompressionSessionPrepareToEncodeFrames(session) == noErr else {
             VTCompressionSessionInvalidate(session)
             return nil
         }
-        self.session = session
+        return session
     }
 
     deinit {
@@ -310,8 +376,15 @@ final class StreamVideoEncoder {
     func encode(_ buffer: CVPixelBuffer, at time: CMTime, forceKeyframe: Bool = false) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard let session else { return false }
         let output = self.output
+        let now = ProcessInfo.processInfo.systemUptime
+        recoverIfNeeded(now: now)
+        guard let session else {
+            output.lock.lock()
+            if !output.closed { output.dropped += 1 }
+            output.lock.unlock()
+            return false
+        }
 
         output.lock.lock()
         guard !output.closed, let keyframe = output.rate.admit(at: time.seconds, forceKeyframe: forceKeyframe) else {
@@ -319,6 +392,10 @@ final class StreamVideoEncoder {
             output.lock.unlock()
             return false
         }
+        // Counted before the call: the handler may run before it returns.
+        output.pending += 1
+        if output.waitingSince == nil { output.waitingSince = now }
+        let generation = output.generation
         output.lock.unlock()
 
         let properties: CFDictionary? = keyframe ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
@@ -327,7 +404,7 @@ final class StreamVideoEncoder {
             session, imageBuffer: buffer, presentationTimeStamp: time, duration: .invalid,
             frameProperties: properties, infoFlagsOut: nil
         ) { status, _, sample in
-            Self.handle(status: status, sample: sample, output: output)
+            Self.handle(status: status, sample: sample, output: output, generation: generation)
         }
         output.lock.lock()
         defer { output.lock.unlock() }
@@ -335,10 +412,57 @@ final class StreamVideoEncoder {
         guard status == noErr else {
             output.rate.failed()
             output.dropped += 1
+            output.pending -= 1
+            if output.pending == 0 { output.waitingSince = nil }
+            output.failuresInRow += 1
+            if status == kVTInvalidSessionErr { output.sessionLost = true }
             return false
         }
         output.rate.sent(keyframe: keyframe)
         return true
+    }
+
+    /// Lock held. A session that VideoToolbox lost, that keeps failing, or that has held a frame
+    /// for 2 s without output is replaced, at most every `rebuildInterval`. The new one starts
+    /// with a keyframe, and sites resend the sequence header if its parameter sets differ.
+    private func recoverIfNeeded(now: Double) {
+        guard !gaveUp else { return }
+        output.lock.lock()
+        let stalled = output.waitingSince.map { now - $0 > Self.rebuildInterval * recoveryTimeScale } ?? false
+        let broken = !output.closed && (output.sessionLost || output.failuresInRow >= Self.failureLimit || stalled)
+        if broken && output.brokenSince == nil { output.brokenSince = now }
+        let brokenSince = output.brokenSince
+        output.lock.unlock()
+        guard broken, let brokenSince else { return }
+
+        if now - brokenSince >= Self.recoveryLimit * recoveryTimeScale {
+            gaveUp = true
+            dropSession()
+            return
+        }
+        guard now >= nextRebuild else { return }
+        nextRebuild = now + Self.rebuildInterval * recoveryTimeScale
+        dropSession()
+        let replacement = refusesRebuildForChecks ? nil
+            : Self.configuredSession(width: width, height: height, bitrate: bitrate, frameRate: frameRate)
+        output.lock.lock()
+        output.generation += 1
+        output.pending = 0
+        output.waitingSince = nil
+        output.rate.restart()
+        if replacement != nil {
+            output.sessionLost = false
+            output.failuresInRow = 0
+        }
+        output.lock.unlock()
+        session = replacement
+    }
+
+    /// Lock held. Lets go of a broken session without waiting on it: it may never answer.
+    private func dropSession() {
+        guard let old = session else { return }
+        session = nil
+        DispatchQueue.global(qos: .utility).async { VTCompressionSessionInvalidate(old) }
     }
 
     /// Completes pending frames, then tears the session down. No output follows its return.
@@ -377,15 +501,23 @@ final class StreamVideoEncoder {
         if let session { VTCompressionSessionInvalidate(session) }
     }
 
-    private static func handle(status: OSStatus, sample: CMSampleBuffer?, output: Output) {
+    private static func handle(status: OSStatus, sample: CMSampleBuffer?, output: Output, generation: Int) {
         let frame = status == noErr ? sample.flatMap(makeFrame) : nil
         output.lock.lock()
+        // From a session that has since been replaced: neither counted nor delivered.
+        guard generation == output.generation else { output.lock.unlock(); return }
+        output.pending = max(0, output.pending - 1)
+        output.waitingSince = output.pending > 0 ? ProcessInfo.processInfo.systemUptime : nil
         guard let frame else {
             output.rate.lost()
             output.dropped += 1
+            output.failuresInRow += 1
+            if status == kVTInvalidSessionErr { output.sessionLost = true }
             output.lock.unlock()
             return
         }
+        output.failuresInRow = 0
+        output.brokenSince = nil
         output.rate.landed(time: frame.time.seconds, bytes: frame.avcc.count, keyframe: frame.keyframe)
         if output.closed { output.lock.unlock(); return }
         output.delivering += 1
@@ -407,11 +539,14 @@ final class StreamVideoEncoder {
 
     private static func makeFrame(_ sample: CMSampleBuffer) -> Frame? {
         guard let block = CMSampleBufferGetDataBuffer(sample) else { return nil }
-        var length = 0
-        var pointer: UnsafeMutablePointer<CChar>?
-        guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &pointer) == kCMBlockBufferNoErr,
-              let pointer else { return nil }
-        let avcc = Data(bytes: pointer, count: length)
+        // Copied rather than read through the data pointer: the block need not be contiguous.
+        let length = CMBlockBufferGetDataLength(block)
+        guard length > 0 else { return nil }
+        var avcc = Data(count: length)
+        let copied = avcc.withUnsafeMutableBytes { bytes in
+            CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: bytes.baseAddress!)
+        }
+        guard copied == kCMBlockBufferNoErr else { return nil }
 
         var keyframe = true
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]],
