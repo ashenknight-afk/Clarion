@@ -6,7 +6,7 @@ picture. First goal: under 100 ms glass to glass. Second: a sharper image.
 ## Frame path
 
 ```
-capture card ─▶ AVCaptureVideoDataOutput (420v / YUY2 / UYVY, late frames discarded)
+capture card ─▶ AVCaptureVideoDataOutput (YUY2 / UYVY / 420v, late frames discarded)
 streaming app ─▶ ScreenCaptureKit window capture (420v, 16:9 crop of the window)
         ─▶ CVMetalTextureCache (zero copy, IOSurface-backed)
         ─▶ [frame generation: 420v copy → VTFrameProcessor → still-pixel lock]
@@ -14,8 +14,10 @@ streaming app ─▶ ScreenCaptureKit window capture (420v, 16:9 crop of the win
         ─▶ CAMetalLayer (2 drawables, framebufferOnly, V-Sync toggle) ─▶ present
 ```
 
-Without frame generation each frame renders on the capture thread the moment it arrives. At most
-one frame is in flight; if the GPU is still busy, the new frame is dropped, not queued.
+Without frame generation the capture thread hands each frame to a present queue and returns. That
+queue waits until the screen can take a frame and then draws the newest one; an older frame still
+waiting is replaced, not queued. If every frame ends up waiting for the screen, one is left out to
+empty the display's queue.
 
 While live, the finished picture also goes to the stream: the renderer hands the frame to the broadcaster
 through the frame sink, and the broadcaster composes, encodes (hardware H.264) and sends it from its own

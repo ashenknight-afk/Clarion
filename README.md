@@ -62,7 +62,7 @@ streaming app.
 | Key | Does |
 |---|---|
 | Tab or ⌘, | Settings |
-| O | Stats overlay |
+| O | Stats: off, compact, full |
 | M | Fit / Fill / Stretch |
 | V | V-Sync (off is fastest and can tear) |
 | U | Upscaling |
@@ -147,8 +147,13 @@ show, and a stream that stalls shows as a stall.
 
 ## Measuring delay
 
-The overlay's LAT line is the time from a frame reaching Clarion to that frame being on screen. It
-does not include the capture card, the network, or the display's own lag. To measure all of it:
+The overlay's LAT line is the time from a frame's capture timestamp to that frame being on screen.
+With a capture card about 20–25 ms of it is the card and macOS delivering the frame (MS2130,
+1080p60, V-Sync on: 43–66 ms in total, depending on how the card's clock lines up with the display's;
+its YUY2 mode is about 6 ms quicker than 420v). It does not include the console's HDMI output, the network,
+or the display's own lag. With V-Sync off the line reads much lower (about 31 ms on the same card),
+but macOS then reports when the frame was handed over, not when it lit up, so treat that number as
+a lower bound. To measure all of it:
 
 1. Press **L**. A square in the corner of the video turns white while the centre of the picture is bright.
 2. Put something that flashes on the console.
@@ -172,7 +177,8 @@ so it asks again after each rebuild unless you set a signing team in Xcode.
 
 ## Known limits
 
-- Never tested with a capture card, on an Intel Mac, or on a display faster than 60 Hz.
+- Tested with one capture card (MacroSilicon MS2130, 1080p60). Never tested on an Intel Mac or on a
+  display faster than 60 Hz.
 - Frame generation is 2× only, and its in-between frames are made at 720p or 1080p.
 - No HDR. Sources are treated as 8-bit SDR.
 - Streaming apps add their own delay, usually more than Clarion's. A capture card avoids it.

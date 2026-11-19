@@ -20,6 +20,26 @@ enum ScalingMode: String, CaseIterable, Identifiable {
     }
 }
 
+/// How much of the stats panel sits over the video.
+enum StatsMode: String, CaseIterable, Identifiable {
+    case off, compact, full
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .off: return "Off"
+        case .compact: return "Compact"
+        case .full: return "Full"
+        }
+    }
+
+    var next: StatsMode {
+        let all = Self.allCases
+        return all[(all.firstIndex(of: self)! + 1) % all.count]
+    }
+}
+
 enum VideoSource: String, CaseIterable, Identifiable {
     case captureCard, window
 
@@ -48,6 +68,7 @@ final class AppSettings: ObservableObject {
         static let scalingMode = "output.scalingMode"
         static let displaySync = "output.displaySync"
         static let showOverlay = "overlay.visible"
+        static let statsMode = "overlay.mode"
         static let upscaling = "enhance.upscaling"
         static let upscaler = "enhance.upscaler"
         static let sharpening = "enhance.sharpening"
@@ -86,7 +107,7 @@ final class AppSettings: ObservableObject {
 
     /// `nil` = pick the first external capture device.
     @Published var deviceID: String? { didSet { defaults.set(deviceID, forKey: Key.deviceID) } }
-    /// `nil` = 1920×1080, 420v preferred.
+    /// `nil` = 1920×1080, YUY2 preferred.
     @Published var formatID: String? { didSet { defaults.set(formatID, forKey: Key.formatID) } }
     /// 0 = highest rate the format supports.
     @Published var frameRate: Double { didSet { defaults.set(frameRate, forKey: Key.frameRate) } }
@@ -94,7 +115,7 @@ final class AppSettings: ObservableObject {
     @Published var displayID: UInt32 { didSet { defaults.set(Int(displayID), forKey: Key.displayID) } }
     @Published var scalingMode: ScalingMode { didSet { defaults.set(scalingMode.rawValue, forKey: Key.scalingMode) } }
     @Published var displaySyncEnabled: Bool { didSet { defaults.set(displaySyncEnabled, forKey: Key.displaySync) } }
-    @Published var showOverlay: Bool { didSet { defaults.set(showOverlay, forKey: Key.showOverlay) } }
+    @Published var statsMode: StatsMode { didSet { defaults.set(statsMode.rawValue, forKey: Key.statsMode) } }
     @Published var upscalingEnabled: Bool { didSet { defaults.set(upscalingEnabled, forKey: Key.upscaling) } }
     /// Preferred method; MetalFX silently falls back to Lanczos where unsupported.
     @Published var upscaler: Upscaler.Kind { didSet { defaults.set(upscaler.rawValue, forKey: Key.upscaler) } }
@@ -145,14 +166,26 @@ final class AppSettings: ObservableObject {
     @Published var cameraCorner: StreamCorner { didSet { defaults.set(cameraCorner.rawValue, forKey: Key.cameraCorner) } }
     @Published var cameraSize: StreamCameraSize { didSet { defaults.set(cameraSize.rawValue, forKey: Key.cameraSize) } }
     var cameraLayout: CameraLayout { CameraLayout(corner: cameraCorner, size: cameraSize) }
-    /// A measuring aid, so it always starts off.
-    @Published var latencyTest = false
+    /// A measuring aid, so it always starts off, and turns itself off again: its square is part of
+    /// the picture and ends up in recordings when forgotten.
+    @Published var latencyTest = false {
+        didSet {
+            latencyTestTimer?.invalidate()
+            guard latencyTest else { return }
+            latencyTestTimer = Timer.scheduledTimer(withTimeInterval: Self.latencyTestDuration, repeats: false) { [weak self] _ in
+                self?.latencyTest = false
+            }
+        }
+    }
+    static let latencyTestDuration: TimeInterval = 300
+    private var latencyTestTimer: Timer?
 
     var renderConfig: RenderConfig {
         RenderConfig(scalingMode: scalingMode, upscaling: upscalingEnabled, upscaler: upscaler,
                      sharpening: sharpeningEnabled, sharpness: Float(effectiveSharpness),
                      frameGeneration: frameGenerationEnabled, fastFrameGeneration: frameGenerationFast,
-                     steadyFrameGeneration: frameGenerationSteady,
+                     // A capture card delivers no late frames to cover for.
+                     steadyFrameGeneration: frameGenerationSteady && source == .window,
                      latencyTest: latencyTest)
     }
 
@@ -181,7 +214,9 @@ final class AppSettings: ObservableObject {
         displayID = UInt32(clamping: defaults.integer(forKey: Key.displayID))
         scalingMode = ScalingMode(rawValue: defaults.string(forKey: Key.scalingMode) ?? "") ?? .fit
         displaySyncEnabled = defaults.object(forKey: Key.displaySync) as? Bool ?? true
-        showOverlay = defaults.object(forKey: Key.showOverlay) as? Bool ?? true
+        // Before the compact mode there was only on and off.
+        statsMode = StatsMode(rawValue: defaults.string(forKey: Key.statsMode) ?? "")
+            ?? (defaults.object(forKey: Key.showOverlay) as? Bool == false ? .off : .compact)
         upscalingEnabled = defaults.object(forKey: Key.upscaling) as? Bool ?? true
         upscaler = Upscaler.Kind(rawValue: defaults.string(forKey: Key.upscaler) ?? "") ?? .metalFX
         sharpeningEnabled = defaults.object(forKey: Key.sharpening) as? Bool ?? true

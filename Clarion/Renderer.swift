@@ -58,6 +58,15 @@ final class Renderer {
         }
     }
 
+    /// A frame on the direct path, waiting for presentQueue.
+    private struct PendingFrame {
+        let pixelBuffer: CVPixelBuffer
+        let captureTime: CFTimeInterval
+        let config: RenderConfig
+        let marker: Bool?
+        let layer: CAMetalLayer
+    }
+
     /// One source frame's output under frame generation, waiting for presentQueue.
     private struct PendingPair {
         /// The in-between frame, if one was made.
@@ -194,9 +203,10 @@ final class Renderer {
                     credit = max(credit, 1)
                     skipShare = min(0.5, max(skipShare * 1.5, 1.0 / 40))
                     windowsAbove += 1
-                    if windowsAbove >= 12 {
-                        // Eight seconds of skipping hasn't brought it down, so the floor is out of date
-                        // (heavier settings). Measure again, but not more than every 30 s.
+                    if windowsAbove >= 6 {
+                        // Four seconds of skipping hasn't brought it down, so the floor is out of date
+                        // (heavier settings, or a capture card's clock has drifted against the
+                        // display's). Measure again, but not more than every 30 s.
                         (skipShare, credit, windowsAbove) = (0, 0, 0)
                         if sinceProbe >= 900 {
                             phase = .draining(pairsLeft: Self.drainPairs)
@@ -206,10 +216,13 @@ final class Renderer {
                     }
                 } else {
                     windowsAbove = 0
-                    if average < floor + 0.6 * margin {
-                        skipShare *= 0.7
-                        if skipShare < 1.0 / 600 { skipShare = 0 }
-                    }
+                    // Always ease off, only more slowly while the delay is still raised. Holding the
+                    // share there got stuck: a capture card's delay sits anywhere in a refresh above
+                    // the floor, depending on how its clock lines up with the display's, and half the
+                    // generated frames were then left out for as long as it stayed in that band
+                    // (recording: 46 fps shown for 40 s at an unchanged 80 ms).
+                    skipShare *= average < floor + 0.6 * margin ? 0.7 : 0.85
+                    if skipShare < 1.0 / 600 { skipShare = 0 }
                 }
             }
         }
@@ -257,6 +270,12 @@ final class Renderer {
     /// `FrameInterpolator` on macOS 26+, else nil (stored untyped for availability).
     private let interpolatorBox: AnyObject?
 
+    // presentQueue only: see presentPendingFrame.
+    private var waitingFrames = 0
+    private var freeFrames = 0
+    private var nextDrain: CFTimeInterval = 0
+    private var drainInterval: CFTimeInterval = 2
+
     // Capture queue only.
     private var videoTexture: MTLTexture?
     private var frameGen = FrameGenState()
@@ -287,6 +306,7 @@ final class Renderer {
     private var lastScaler = "—"
     private var frameGenStatus: String?
     private var pendingPair: PendingPair?
+    private var pendingFrame: PendingFrame?
     private var governor = LatencyGovernor()
     private var frameSink: FrameSink?
     private var sinkPool: CVPixelBufferPool?
@@ -403,29 +423,85 @@ final class Renderer {
         DispatchQueue.main.async { layer.maximumDrawableCount = count }
     }
 
+    /// Hands the frame to presentQueue, which draws the newest one each time the screen can take
+    /// another. Drawing here instead means waiting for a drawable with the frame already chosen: a
+    /// capture card runs on its own clock, a little faster or slower than the display, so that wait
+    /// is nearly always a whole refresh and the frame ages through it (MS2130 card, 1080p60 on a
+    /// 60 Hz screen: 81–89 ms that way).
     private func renderDirect(_ pixelBuffer: CVPixelBuffer, captureTime: CFTimeInterval, layer: CAMetalLayer,
                               config: RenderConfig, marker: Bool?) {
-        // Never queue behind a stalled frame; drop this one and catch the next.
+        let frame = PendingFrame(pixelBuffer: pixelBuffer, captureTime: captureTime, config: config,
+                                 marker: marker, layer: layer)
+        let replaced = locked { () -> Bool in
+            let replaced = pendingFrame != nil
+            pendingFrame = frame
+            return replaced
+        }
+        if replaced {
+            // The screen hasn't taken the last frame yet: this newer one goes in its place.
+            noteDroppedFrame()
+        } else {
+            presentQueue.async { [weak self] in self?.presentPendingFrame() }
+        }
+    }
+
+    /// Runs on presentQueue. Waits for the previous frame's GPU work and for a drawable first, and
+    /// only then takes the frame, so what gets drawn is the newest one there is.
+    private func presentPendingFrame() {
+        guard let layer = locked({ pendingFrame?.layer }) else { return }
         guard inFlight.wait(timeout: .now() + .milliseconds(50)) == .success else {
+            locked { pendingFrame = nil }
             noteDroppedFrame()
             return
         }
-        guard let planes = makeTextures(pixelBuffer),
-              let drawable = layer.nextDrawable(),
+        let asked = CACurrentMediaTime()
+        let drawable = layer.nextDrawable()
+        let now = CACurrentMediaTime()
+        // A source as fast as the display can settle into waiting for a drawable on every frame.
+        // That state keeps itself going, and so does the other one, where a drawable is free the
+        // moment a frame arrives: the free one is released just after the compositor's cut-off for
+        // the next refresh, so a frame drawn then waits most of a refresh for the cut-off after it
+        // (MS2130, 1080p60: 61–64 ms waiting, 49–55 not). Leaving one frame out moves it across.
+        // At some phases between source and display it moves straight back, so retry ever less often.
+        if now - asked > 0.001 {
+            (waitingFrames, freeFrames) = (waitingFrames + 1, 0)
+        } else {
+            (waitingFrames, freeFrames) = (0, freeFrames + 1)
+            if freeFrames == 300 { drainInterval = 2 }
+        }
+        if waitingFrames >= 30, now >= nextDrain {
+            waitingFrames = 0
+            nextDrain = now + drainInterval
+            drainInterval = min(drainInterval * 2, 30)
+            locked { pendingFrame = nil }
+            inFlight.signal()
+            noteDroppedFrame()
+            return
+        }
+        guard let frame = locked({ () -> PendingFrame? in
+            defer { pendingFrame = nil }
+            return pendingFrame
+        }) else {
+            inFlight.signal()
+            return
+        }
+        guard let drawable,
+              let planes = makeTextures(frame.pixelBuffer),
               let commandBuffer = commandQueue.makeCommandBuffer(),
-              case (true, let tapped) = encodeFrame(planes, of: pixelBuffer, into: drawable.texture, config: config,
-                                                    marker: marker, commandBuffer: commandBuffer) else {
+              case (true, let tapped) = encodeFrame(planes, of: frame.pixelBuffer, into: drawable.texture,
+                                                    config: frame.config, marker: frame.marker,
+                                                    commandBuffer: commandBuffer) else {
             inFlight.signal()
             noteDroppedFrame()
             return
         }
         drawable.addPresentedHandler { [weak self] presented in
-            self?.notePresented(at: presented.presentedTime, captureTime: captureTime, tapped: tapped)
+            self?.notePresented(at: presented.presentedTime, captureTime: frame.captureTime, tapped: tapped)
         }
         commandBuffer.present(drawable)
         commandBuffer.addCompletedHandler { [weak self] buffer in
             // The CVMetalTextures must outlive the GPU work that samples them.
-            withExtendedLifetime(planes) {}
+            withExtendedLifetime((planes, frame.pixelBuffer)) {}
             guard let self else { return }
             let ms = (buffer.gpuEndTime - buffer.gpuStartTime) * 1000
             self.locked { self.gpuMs = ms }
