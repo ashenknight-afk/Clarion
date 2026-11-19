@@ -232,6 +232,29 @@ func rtmpChunkChecks() {
         queue.enqueue(video(3600, key: true))
         try expect(!queue.isDropping && queue.next()?.timestamp == 3600)
     }
+    check("rtmp send queue sends control items ahead of queued media, in their own order") {
+        func control(_ tag: UInt8) -> Item { Item(bytes: Data([tag]), timestamp: 900, isVideo: false, isKeyframe: false, isControl: true) }
+        var queue = RTMPSendQueue()
+        queue.enqueue(video(0, key: true))
+        queue.enqueue(audio(10))
+        // The first video item is already being written: it is no longer in the queue.
+        try expect(queue.next()?.bytes == Data([1]))
+        queue.enqueue(video(33))
+        queue.enqueue(control(7))
+        queue.enqueue(audio(43))
+        queue.enqueue(control(8))
+        var order: [UInt8] = []
+        while let item = queue.next() { order.append(item.bytes.first ?? 0) }
+        try expect(order == [7, 8, 2, 1, 2], "order \(order)")
+    }
+    check("rtmp send queue backlog ignores control items") {
+        var queue = RTMPSendQueue()
+        for ts in stride(from: UInt32(1000), through: 3200, by: 550) { queue.enqueue(video(ts, key: ts == 1000)) }
+        // A control item carrying an older timestamp must not make the backlog look longer.
+        queue.enqueue(Item(bytes: Data([9]), timestamp: 0, isVideo: false, isKeyframe: false, isControl: true))
+        queue.enqueue(video(3500))
+        try expect(!queue.isDropping && queue.droppedVideoFrames == 0, "dropping \(queue.droppedVideoFrames)")
+    }
     check("rtmp send queue measures only items not yet taken") {
         var queue = RTMPSendQueue()
         for ts in stride(from: UInt32(0), through: 3500, by: 500) {

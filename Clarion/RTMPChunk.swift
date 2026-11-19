@@ -194,6 +194,8 @@ struct RTMPSendQueue {
         let timestamp: UInt32
         let isVideo: Bool
         let isKeyframe: Bool
+        /// Goes ahead of every queued item that isn't control too.
+        var isControl = false
     }
 
     static let limitMs: UInt32 = 3000
@@ -216,7 +218,10 @@ struct RTMPSendQueue {
             }
             isDropping = false
         }
-        items.append(item)
+        guard item.isControl else { return items.append(item) }
+        // Behind earlier control items, ahead of the rest. An item being written has already been
+        // taken by `next`, so no message is ever split.
+        items.insert(item, at: items.firstIndex { !$0.isControl } ?? items.count)
     }
 
     mutating func next() -> Item? {
@@ -224,8 +229,9 @@ struct RTMPSendQueue {
     }
 
     /// Newest minus oldest queued timestamp, wrap-safe; negative (slightly out-of-order items) counts as zero.
+    /// Control items are left out: they jump the queue carrying the newest timestamp.
     private var queuedMs: UInt32 {
-        guard let first = items.first, let last = items.last else { return 0 }
+        guard let first = items.first(where: { !$0.isControl }), let last = items.last(where: { !$0.isControl }) else { return 0 }
         return UInt32(max(0, Int32(bitPattern: last.timestamp &- first.timestamp)))
     }
 }

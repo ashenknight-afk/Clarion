@@ -95,6 +95,23 @@ func rtmpConnectionChecks() {
         try expect(target?.tls == false, "tls")
     }
 
+    check("target keeps a server's query on the app and the tcUrl") {
+        let target = RTMPConnection.Target(server: "rtmps://b.rtmps.youtube.com/live2?backup=1", key: "made-up-key")
+        try expect(target?.app == "live2?backup=1", "app \(target?.app ?? "nil")")
+        try expect(target?.tcUrl == "rtmps://b.rtmps.youtube.com/live2?backup=1", "tcUrl \(target?.tcUrl ?? "nil")")
+        try expect(target.map { !"\($0)".contains("made-up-key") } == true, "key in the description")
+        try expect(RTMPConnection.Target(server: "rtmps://x/live2?", key: "k")?.app == "live2", "empty query kept")
+    }
+
+    check("plain rtmp:// to another machine is flagged as sending the key unencrypted") {
+        try expect(RTMPConnection.Target.sendsKeyInClear(server: "rtmp://live.example.com/app"), "remote rtmp not flagged")
+        try expect(RTMPConnection.Target.sendsKeyInClear(server: " RTMP://10.0.0.5:1935/live "), "LAN rtmp not flagged")
+        for local in ["rtmp://localhost/live", "rtmp://127.0.0.1:1935/live", "rtmp://[::1]:1935/live",
+                      "rtmps://live.example.com/app", "", "live.example.com/app"] {
+            try expect(!RTMPConnection.Target.sendsKeyInClear(server: local), "\(local) flagged")
+        }
+    }
+
     check("target rejects other schemes and an empty key") {
         try expect(RTMPConnection.Target(server: "http://x/y", key: "k") == nil, "http accepted")
         try expect(RTMPConnection.Target(server: "rtmps://x/y", key: " \n") == nil, "empty key accepted")

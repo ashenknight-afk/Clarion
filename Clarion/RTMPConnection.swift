@@ -4,7 +4,7 @@ import Security
 
 /// Publishes one stream to an RTMP(S) ingest server: handshake, connect, createStream, publish,
 /// then media. Every method may be called from any thread; the work runs on `queue`, and
-/// `sentBytes` and `droppedVideoFrames` should be read there.
+/// `sentBytes` should be read there.
 final class RTMPConnection {
     struct Target: Equatable {
         let host: String
@@ -13,15 +13,17 @@ final class RTMPConnection {
         let app: String
         let key: String
 
-        /// `server` is "rtmps://host[:port]/app"; plain `rtmp://` exists for the local test server.
+        /// `server` is "rtmps://host[:port]/app[?query]"; plain `rtmp://` exists for the local test server.
+        /// A query stays on the app name, as librtmp keeps it (YouTube's backup ingest is `live2?backup=1`).
         init?(server: String, key: String) {
             let key = key.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !key.isEmpty,
                   let url = URLComponents(string: server.trimmingCharacters(in: .whitespacesAndNewlines)),
                   let scheme = url.scheme?.lowercased(), scheme == "rtmp" || scheme == "rtmps",
                   let host = url.host, !host.isEmpty else { return nil }
-            let app = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            var app = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             guard !app.isEmpty else { return nil }
+            if let query = url.percentEncodedQuery, !query.isEmpty { app += "?" + query }
             let tls = scheme == "rtmps"
             var port: UInt16 = tls ? 443 : 1935
             if let explicit = url.port {
@@ -33,6 +35,13 @@ final class RTMPConnection {
             self.tls = tls
             self.app = app
             self.key = key
+        }
+
+        /// Whether a server address sends the key unencrypted: plain `rtmp://` to anything but this Mac.
+        static func sendsKeyInClear(server: String) -> Bool {
+            guard let url = URLComponents(string: server.trimmingCharacters(in: .whitespacesAndNewlines)),
+                  url.scheme?.lowercased() == "rtmp", let host = url.host?.lowercased(), !host.isEmpty else { return false }
+            return !["localhost", "127.0.0.1", "::1", "[::1]"].contains(host)
         }
 
         /// The server's address as sent in `connect`. It never contains the key.
@@ -75,7 +84,6 @@ final class RTMPConnection {
     /// Set before `start`.
     var stallTimeout = RTMPConnection.stallTimeout
     private(set) var sentBytes = 0
-    var droppedVideoFrames: Int { sendQueue.droppedVideoFrames }
     /// True while the network is too slow and video is being thrown away.
     var isDropping: Bool { sendQueue.isDropping }
     /// The failure was the server saying no (`_error`, a refused publish) before publishing, not the network.
@@ -476,12 +484,15 @@ final class RTMPConnection {
         enqueue(message, chunkStream: Self.commandChunkStream)
     }
 
-    /// Anything but video, which `send(video:)` queues itself so the queue can drop it.
+    /// Anything but video, which `send(video:)` queues itself so the queue can drop it. Protocol
+    /// control and commands (ping replies, acknowledgements, FCUnpublish) go ahead of queued media:
+    /// they are on chunk streams of their own, so the order within each chunk stream is kept.
     private func enqueue(_ message: RTMPMessage, chunkStream: UInt8) {
         let bytes = writer.chunks(for: message, chunkStreamID: chunkStream)
         let isMedia = message.type == RTMPMessage.Kind.video.rawValue || message.type == RTMPMessage.Kind.audio.rawValue
         let timestamp = isMedia ? message.timestamp : lastMediaTimestamp
-        sendQueue.enqueue(.init(bytes: bytes, timestamp: timestamp, isVideo: false, isKeyframe: false))
+        let isControl = chunkStream == Self.controlChunkStream || chunkStream == Self.commandChunkStream
+        sendQueue.enqueue(.init(bytes: bytes, timestamp: timestamp, isVideo: false, isKeyframe: false, isControl: isControl))
         pump()
     }
 
@@ -491,8 +502,9 @@ final class RTMPConnection {
         return .init(bytes: bytes, timestamp: timestamp, isVideo: !isSequenceHeader, isKeyframe: keyframe)
     }
 
+    /// The handshake: control, so the commands that follow it never overtake it.
     private func enqueueRaw(_ bytes: Data) {
-        sendQueue.enqueue(.init(bytes: bytes, timestamp: lastMediaTimestamp, isVideo: false, isKeyframe: false))
+        sendQueue.enqueue(.init(bytes: bytes, timestamp: lastMediaTimestamp, isVideo: false, isKeyframe: false, isControl: true))
         pump()
     }
 
@@ -534,8 +546,10 @@ final class RTMPConnection {
 }
 
 extension RTMPConnection.Target: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
-    /// The address without the key, so printing a target never shows it.
-    var description: String { "\(tcUrl) (key hidden)" }
+    /// The address without the key, so printing a target never shows it (not even pasted into the address).
+    var description: String { "\(RTMPConnection.redact(tcUrl, key: key)) (key hidden)" }
     var debugDescription: String { description }
-    var customMirror: Mirror { Mirror(self, children: ["tcUrl": tcUrl], displayStyle: .struct) }
+    var customMirror: Mirror {
+        Mirror(self, children: ["tcUrl": RTMPConnection.redact(tcUrl, key: key)], displayStyle: .struct)
+    }
 }
