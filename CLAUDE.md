@@ -73,7 +73,8 @@ dependencies, no drivers, sandboxed. macOS 14+, Apple Silicon first, Intel must 
 - While live, the stats overlay is drawn on a copy (`sharesFrames`), so it can be in a recording and never in the stream.
 - Hardware H.264 encoder only, no software fallback. It ignored bitrate caps on an M3; the broadcaster holds the
   bitrate by skipping frames.
-- Stream keys live only in the keychain: never in UserDefaults, logs or error text.
+- Stream keys live only in `StreamKeyStore`'s files (0600, the app's own folder): never in UserDefaults, logs or
+  error text. Not the keychain: an ad hoc build is asked for the login password after every rebuild.
 - The latency test's square is drawn into the picture the sink gets, so it is unavailable while live: L is ignored,
   the toggle is disabled, and going live turns it off. Don't solve this in Renderer's frame paths.
 - A broken encoder session is rebuilt inside `StreamVideoEncoder` (at most every 2 s, given up after 10 s); the rate

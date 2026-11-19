@@ -16,7 +16,7 @@ SOURCES=(
   Clarion/CaptureManager.swift
   Clarion/StreamCompositor.swift
   Clarion/Recorder.swift
-  Clarion/StreamKeychain.swift
+  Clarion/StreamKeyStore.swift
   Clarion/BroadcastSite.swift
   Clarion/Broadcaster.swift
 )

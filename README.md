@@ -80,8 +80,9 @@ Clarion can stream what it shows to Twitch and YouTube, with the game's sound, y
 a webcam. It uses the Mac's hardware H.264 encoder and nothing else. No key starts a stream: open
 Settings (Tab), find Live stream and press Go live.
 
-Type each site's stream key into Settings. Keys are kept in the login keychain, not in a file. Set
-the title and who can watch on the site itself.
+Type each site's stream key into Settings. Keys are kept in a file only your user account can
+read, in Clarion's own folder, and are not encrypted. Set the title and who can watch on the site
+itself.
 
 - Twitch gets 1080p60 at 6,000 kbps, sent to `rtmps://live.twitch.tv/app`.
 - YouTube gets 1080p, 1440p (the default) or 2160p at 9,000, 18,000 or 35,000 kbps, sent to

@@ -135,7 +135,7 @@ final class AppSettings: ObservableObject {
     @Published var audioDeviceID: String? { didSet { defaults.set(audioDeviceID, forKey: Key.audioDeviceID) } }
     /// 0…1.
     @Published var audioVolume: Double { didSet { defaults.set(audioVolume, forKey: Key.audioVolume) } }
-    /// Stream keys are not settings: they live in the keychain (`StreamKeychain`).
+    /// Stream keys are not settings: they live in files of their own (`StreamKeyStore`).
     @Published var streamEnabled: [StreamSite: Bool] {
         didSet { StreamSite.allCases.forEach { defaults.set(streamEnabled[$0] ?? false, forKey: Key.streamEnabled($0)) } }
     }
@@ -243,16 +243,16 @@ final class AppSettings: ObservableObject {
         cameraSize = defaults.string(forKey: Key.cameraSize).flatMap(StreamCameraSize.init(rawValue:)) ?? .medium
     }
 
-    /// Reads the stream keys from the keychain: call it only when going live.
+    /// Reads the stream keys: call it only when going live.
     func makeStreamConfig() -> StreamConfig {
         let sites = StreamSite.allCases.filter { streamEnabled[$0] == true }.map { site -> StreamSiteConfig in
             let server = (streamServer[site] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            let read = StreamKeychain.read(for: site)
+            let read = StreamKeyStore.read(for: site)
             return StreamSiteConfig(site: site, server: server.isEmpty ? site.defaultServer : server,
                                     key: read.key ?? "",
                                     quality: site == .youtube ? streamYouTubeQuality : .p1080,
                                     bitrate: streamBitrate[site] ?? 0,
-                                    keyUnreadable: read.key == nil && StreamKeychain.isUnreadable(read.status))
+                                    keyUnreadable: read.unreadable)
         }
         return StreamConfig(sites: sites, gameVolume: Float(streamGameVolume),
                             camera: cameraEnabled ? (cameraDeviceID, cameraLayout) : nil,

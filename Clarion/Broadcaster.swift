@@ -43,7 +43,7 @@ struct StreamSiteConfig {
     let quality: StreamQuality
     /// Bits per second; 0 = the site's default for the canvas in use.
     let bitrate: Int
-    /// The keychain had a key but wouldn't hand it over (a denied prompt after a rebuild); `key` is then empty.
+    /// A key is saved but its file couldn't be read; `key` is then empty.
     var keyUnreadable = false
 }
 
@@ -163,7 +163,7 @@ final class Broadcaster: ObservableObject {
         guard !isLive, !ending else { return }
         guard !config.sites.isEmpty else { return show("Turn on Twitch or YouTube in Settings") }
         if let unreadable = config.sites.first(where: \.keyUnreadable) {
-            return show("Clarion couldn't read the \(unreadable.site.label) key from the keychain")
+            return show("Clarion couldn't read the saved \(unreadable.site.label) key")
         }
         if let missing = config.sites.first(where: { $0.key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
             return show("Add a \(missing.site.label) stream key in Settings")

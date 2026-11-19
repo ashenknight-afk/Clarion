@@ -374,29 +374,27 @@ func broadcasterChecks() {
         }
     }
 
-    check("stream keys go in and out of the keychain") {
-        try expect(StreamKeychain.service.hasSuffix(".checks"), "harness service \(StreamKeychain.service)")
-        let cleared = StreamKeychain.set(nil, for: .youtube)
-        if StreamKeychain.needsInteraction(cleared) {
-            print("skip: keychain checks (the keychain wants interaction)")
-            return
-        }
-        // The item is this run's own (the account carries the process id); never leave it behind.
-        defer { StreamKeychain.set(nil, for: .youtube) }
-        let added = StreamKeychain.set("check-key-123", for: .youtube)
-        if StreamKeychain.needsInteraction(added) {
-            print("skip: keychain checks (the keychain wants interaction)")
-            return
-        }
-        try expect(added == errSecSuccess, "add status \(added)")
-        try expect(StreamKeychain.key(for: .youtube) == "check-key-123", "read back")
-        try expect(StreamKeychain.hasKey(for: .youtube), "saved key not seen")
-        try expect(StreamKeychain.set("", for: .youtube) == errSecSuccess, "empty deletes")
-        try expect(StreamKeychain.key(for: .youtube) == nil, "read after delete")
-        try expect(!StreamKeychain.hasKey(for: .youtube), "deleted key still seen")
-        StreamKeychain.set("other", for: .youtube)
-        StreamKeychain.set(nil, for: .youtube)
-        try expect(StreamKeychain.key(for: .youtube) == nil, "read after nil")
+    check("stream keys are saved, read back and removed") {
+        try expect(StreamKeyStore.folder.path.contains(".checks."), "harness folder \(StreamKeyStore.folder.path)")
+        // The folder is this run's own (its name carries the process id); never leave it behind.
+        defer { try? FileManager.default.removeItem(at: StreamKeyStore.folder) }
+        try expect(StreamKeyStore.set(nil, for: .youtube), "removing nothing")
+        try expect(StreamKeyStore.set("check-key-123", for: .youtube), "save")
+        try expect(StreamKeyStore.key(for: .youtube) == "check-key-123", "read back")
+        try expect(StreamKeyStore.hasKey(for: .youtube), "saved key not seen")
+        try expect(!StreamKeyStore.hasKey(for: .twitch), "a key for the other site")
+        let file = StreamKeyStore.folder.appendingPathComponent("youtube.key")
+        let mode = try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? Int
+        try expect(mode == 0o600, "file mode \(String(mode ?? -1, radix: 8))")
+        try expect(StreamKeyStore.set("replaced", for: .youtube), "replace")
+        try expect(StreamKeyStore.key(for: .youtube) == "replaced", "read after replace")
+        try expect(StreamKeyStore.set("", for: .youtube), "empty deletes")
+        try expect(StreamKeyStore.key(for: .youtube) == nil, "read after delete")
+        try expect(!StreamKeyStore.hasKey(for: .youtube), "deleted key still seen")
+        try Data([0xff, 0xfe]).write(to: file)
+        let bad = StreamKeyStore.read(for: .youtube)
+        try expect(bad.key == nil && bad.unreadable, "a file that isn't text counts as unreadable")
+        try expect(StreamKeyStore.set(nil, for: .youtube), "remove")
     }
 
     guard let device = MTLCreateSystemDefaultDevice() else {
@@ -956,14 +954,14 @@ func broadcasterChecks() {
         try ends(broadcaster)
     }
 
-    check("a key the keychain wouldn't hand over is named as such") {
+    check("a saved key that can't be read is named as such") {
         let broadcaster = Broadcaster(device: device, library: library)
         broadcaster.goLive(StreamConfig(sites: [StreamSiteConfig(site: .youtube, server: "rtmp://127.0.0.1:1935/live", key: "",
                                                                  quality: .p1080, bitrate: 0, keyUnreadable: true)],
                                         gameVolume: 1, camera: nil, mic: nil))
         spin(timeout: 0.1)
         try expect(!broadcaster.isLive, "went live without a key")
-        try expect(broadcaster.notice == "Clarion couldn't read the YouTube key from the keychain", "notice \(broadcaster.notice ?? "nil")")
+        try expect(broadcaster.notice == "Clarion couldn't read the saved YouTube key", "notice \(broadcaster.notice ?? "nil")")
     }
 
     check("going live clears a failure left from an earlier stream on a site now off") {
