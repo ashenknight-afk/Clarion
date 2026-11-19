@@ -102,12 +102,22 @@ the badge says MIC OFF while it is muted. "Remove game sound from the microphone
 game plays from the Mac's speakers, so it doesn't come back through the microphone. macOS lowers
 other sound a little while it is on. With headphones, turn it off.
 
-If a connection drops, Clarion retries five times, after 1, 2, 4, 8 and 16 seconds. Then that site
-stops and says why, and the other one carries on. Retries are for a connection that drops after the stream has started. A site that refuses the
-stream, because the key is wrong or it is already live, is not retried, and neither is one whose
-first connection fails. When the connection is too slow, video is dropped
-up to the next keyframe, sound keeps going, and the site's line in Settings says "Connection too
-slow".
+A connection that drops after the stream has started is retried five times, after 1, 2, 4, 8 and
+16 seconds. Then that site stops and says why, and the other one carries on. A site that refuses the
+stream (a wrong key, or already live), or whose first connection fails, is not retried. When the
+connection is too slow, video is dropped up to the next keyframe, sound keeps going, and the site's
+line in Settings says "Connection too slow".
+
+If the hardware encoder loses its session or stops answering, Clarion starts a new one and the
+stream picks up again from a keyframe. If no frame has come out 10 seconds later, the sites using
+that encoder stop with "The video encoder stopped working".
+
+The server field takes a full address, including anything after a `?` (YouTube's backup ingest is
+`rtmps://b.rtmps.youtube.com/live2?backup=1`). A plain `rtmp://` address sends the stream key
+unencrypted, and Settings says so under the field.
+
+The latency test's square is part of the picture, so it is not available while live: L does nothing,
+and going live turns it off.
 
 Limits:
 
@@ -155,7 +165,7 @@ or the display's own lag. With V-Sync off the line reads much lower (about 31 ms
 but macOS then reports when the frame was handed over, not when it lit up, so treat that number as
 a lower bound. To measure all of it:
 
-1. Press **L**. A square in the corner of the video turns white while the centre of the picture is bright.
+1. Press **L** (not while live). A square in the corner of the video turns white while the centre of the picture is bright.
 2. Put something that flashes on the console.
 3. Film the controller and the screen together in slow motion and count frames from the button
    press to the square. At 240 fps each frame is 4.2 ms.

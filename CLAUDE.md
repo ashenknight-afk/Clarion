@@ -74,6 +74,10 @@ dependencies, no drivers, sandboxed. macOS 14+, Apple Silicon first, Intel must 
 - Hardware H.264 encoder only, no software fallback. It ignored bitrate caps on an M3; the broadcaster holds the
   bitrate by skipping frames.
 - Stream keys live only in the keychain: never in UserDefaults, logs or error text.
+- The latency test's square is drawn into the picture the sink gets, so it is unavailable while live: L is ignored,
+  the toggle is disabled, and going live turns it off. Don't solve this in Renderer's frame paths.
+- A broken encoder session is rebuilt inside `StreamVideoEncoder` (at most every 2 s, given up after 10 s); the rate
+  guard is untouched by it apart from forgetting the frames lost with the old session.
 - The LIVE badge goes through `updateOverlayVisibility` like the other badges: the overlay view stays hidden when
   nothing is shown. Its timer exists only while live.
 - Frame generation APIs are macOS 26+: keep them behind `#available` (the interpolator is stored untyped in Renderer) and hide the toggle when unsupported.

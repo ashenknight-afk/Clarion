@@ -40,6 +40,11 @@ generated frame, then the real one a refresh later, from three drawables.
    Reconnects on its own. A LIVE badge on the owner's screen, never in the stream. Checked against a local
    RTMP server (`scripts/check-stream.sh`). The delays while live have not been measured yet, nor a stream
    of an hour, nor a stream to the real sites.
+   An encoder session that VideoToolbox loses, that keeps failing, or that holds a frame for 2 s without
+   output is rebuilt (at most every 2 s) and restarts with a keyframe; after 10 s without output the sites
+   on it fail and the others go on. The video is tagged BT.709 in the session, the canvas buffers and the SPS.
+   Known cost: recording with the stats while live copies each frame on the CPU, on the recorder's queue,
+   so the stats can be drawn on the copy and stay out of the stream. It is off the frame path.
 
 ## Looked at and not built
 
