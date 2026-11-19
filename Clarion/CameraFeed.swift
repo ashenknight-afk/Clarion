@@ -157,14 +157,6 @@ final class CameraFeed: NSObject, ObservableObject, CameraSource {
         }
     }
 
-    /// Lets go of the camera for every user.
-    func stop() {
-        queue.async {
-            self.holds.removeAll()
-            self.shutDown()
-        }
-    }
-
     // MARK: - queue
 
     private func shutDown() {

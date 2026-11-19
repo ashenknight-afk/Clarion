@@ -28,7 +28,6 @@ final class BroadcastSite {
 
     enum State: Equatable { case connecting, live, reconnecting(Int), failed(String), closed }
 
-    let config: StreamSiteConfig
     let quality: StreamQuality
     let bitrate: Int
     /// Reports state changes, on the queue. `.failed` and `.closed` are final.
@@ -63,7 +62,6 @@ final class BroadcastSite {
         guard let target = RTMPConnection.Target(server: config.server, key: config.key) else {
             throw StartError(text: "Check the server address in Settings")
         }
-        self.config = config
         self.quality = quality
         self.bitrate = bitrate
         self.queue = queue
@@ -128,6 +126,11 @@ final class BroadcastSite {
         samples.removeAll { now - $0.time > window + 0.01 }
         guard let first = samples.first, now - first.time >= 0.9 else { return nil }
         return Double(connection.sentBytes - first.bytes) * 8 / (now - first.time)
+    }
+
+    /// Ends this site with `text` as its failure, closing its connection. Reported through `onState`.
+    func stop(because text: String) {
+        fail(text)
     }
 
     /// Unpublishes and closes. `completion` runs on the queue. Frames the shared encoder still

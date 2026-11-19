@@ -376,7 +376,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "s": settings.sharpeningEnabled.toggle()
         case "f" where renderer?.supportsFrameGeneration == true: settings.frameGenerationEnabled.toggle()
         case "a": settings.audioEnabled.toggle()
-        case "l": settings.latencyTest.toggle()
+        // The test's square is part of the picture, so it would reach the stream.
+        case "l": if broadcaster?.isLive != true { settings.latencyTest.toggle() }
         case "p": recorder.takeScreenshot()
         case "r": recorder.toggleRecording()
         case "v": settings.displaySyncEnabled.toggle()

@@ -339,8 +339,11 @@ struct SettingsView: View {
             }
             .pickerStyle(.segmented)
 
-            noted("A square in the video's corner turns white while the centre of the picture is bright. Film the screen in slow motion to time it. Turns itself off after \(Int(AppSettings.latencyTestDuration / 60)) minutes.") {
-                Toggle("Latency test", isOn: $settings.latencyTest)
+            noted("A square in the video's corner turns white while the centre of the picture is bright. Film the screen in slow motion to time it. Turns itself off after \(Int(AppSettings.latencyTestDuration / 60)) minutes. Not available while live: the square would be in the stream.") {
+                WhileLive(broadcaster: broadcaster) { live in
+                    Toggle("Latency test", isOn: $settings.latencyTest)
+                        .disabled(live)
+                }
             }
         }
     }
@@ -385,4 +388,13 @@ struct SettingsView: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
+}
+
+/// Content that depends on whether a stream is live. Observes the broadcaster itself, so its
+/// frequent updates redraw only this, not the whole panel.
+private struct WhileLive<Content: View>: View {
+    @ObservedObject var broadcaster: Broadcaster
+    @ViewBuilder let content: (Bool) -> Content
+
+    var body: some View { content(broadcaster.isLive) }
 }

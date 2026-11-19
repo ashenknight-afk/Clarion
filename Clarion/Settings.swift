@@ -247,10 +247,12 @@ final class AppSettings: ObservableObject {
     func makeStreamConfig() -> StreamConfig {
         let sites = StreamSite.allCases.filter { streamEnabled[$0] == true }.map { site -> StreamSiteConfig in
             let server = (streamServer[site] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let read = StreamKeychain.read(for: site)
             return StreamSiteConfig(site: site, server: server.isEmpty ? site.defaultServer : server,
-                                    key: StreamKeychain.key(for: site) ?? "",
+                                    key: read.key ?? "",
                                     quality: site == .youtube ? streamYouTubeQuality : .p1080,
-                                    bitrate: streamBitrate[site] ?? 0)
+                                    bitrate: streamBitrate[site] ?? 0,
+                                    keyUnreadable: read.key == nil && StreamKeychain.isUnreadable(read.status))
         }
         return StreamConfig(sites: sites, gameVolume: Float(streamGameVolume),
                             camera: cameraEnabled ? (cameraDeviceID, cameraLayout) : nil,

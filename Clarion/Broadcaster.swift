@@ -43,6 +43,8 @@ struct StreamSiteConfig {
     let quality: StreamQuality
     /// Bits per second; 0 = the site's default for the canvas in use.
     let bitrate: Int
+    /// The keychain had a key but wouldn't hand it over (a denied prompt after a rebuild); `key` is then empty.
+    var keyUnreadable = false
 }
 
 struct StreamConfig {
@@ -102,6 +104,10 @@ final class Broadcaster: ObservableObject {
     /// Checks only: each mixed sound block (interleaved stereo, host time of its start) before it is encoded, on the queue.
     /// Set before `goLive`.
     var onSoundBlock: (([Float], Double) -> Void)?
+    /// Checks only: each video encoder as it is made, on the queue. Set before `goLive`.
+    var onEncoder: ((StreamVideoEncoder) -> Void)?
+    /// Checks only: the host time at which a lost microphone's sound is taken out of the mix, on the queue.
+    var onMicRemoved: ((Double) -> Void)?
 
     private let queue = DispatchQueue(label: "clarion.broadcaster", qos: .userInitiated)
     private let compositor: StreamCompositor?
@@ -115,6 +121,8 @@ final class Broadcaster: ObservableObject {
     private var cameraStarted = false
     /// The camera ran during this stream, so a later loss is a disconnect rather than none found.
     private var cameraSeen = false
+    /// The same for the microphone.
+    private var micSeen = false
     /// Completions of `end` calls made while an end was already running.
     private var endCompletions: [() -> Void] = []
 
@@ -154,6 +162,9 @@ final class Broadcaster: ObservableObject {
     func goLive(_ config: StreamConfig) {
         guard !isLive, !ending else { return }
         guard !config.sites.isEmpty else { return show("Turn on Twitch or YouTube in Settings") }
+        if let unreadable = config.sites.first(where: \.keyUnreadable) {
+            return show("Clarion couldn't read the \(unreadable.site.label) key from the keychain")
+        }
         if let missing = config.sites.first(where: { $0.key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
             return show("Add a \(missing.site.label) stream key in Settings")
         }
@@ -161,6 +172,8 @@ final class Broadcaster: ObservableObject {
         notice = nil
         info = [:]
         startedAt = nil
+        // A failure line left from an earlier stream on a site that is now off must go too.
+        for site in StreamSite.allCases where states[site] != .off { states[site] = .off }
         for site in config.sites { states[site.site] = .connecting }
         onWantsFrames?(true)
         onWantsAudio?(true)
@@ -264,7 +277,8 @@ final class Broadcaster: ObservableObject {
 
     // MARK: - Main thread helpers
 
-    private func show(_ text: String) {
+    /// A short note under the go-live button and over the video, cleared after `noticeDuration`.
+    func show(_ text: String) {
         notice = text
     }
 
@@ -295,6 +309,7 @@ final class Broadcaster: ObservableObject {
     private func startMic(_ mic: (deviceID: String?, volume: Float, removeGameSound: Bool)?) {
         micSession += 1
         micMuted = false
+        micSeen = false
         guard let mic else { return micState = .off }
         let session = micSession
         micSource.onSamples = { [weak self] samples, hostTime in self?.handle(micSamples: samples, hostTime: hostTime) }
@@ -318,8 +333,11 @@ final class Broadcaster: ObservableObject {
         guard session == micSession else { return }
         micState = state
         switch state {
+        case .running, .plainFallback:
+            micSeen = true
+            return
         case .unavailable:
-            notice = "Microphone disconnected"
+            notice = micSeen ? "Microphone disconnected" : "No microphone found"
         case .denied:
             notice = "Clarion isn't allowed to use the microphone"
         default:
@@ -328,7 +346,10 @@ final class Broadcaster: ObservableObject {
         micMuted = false
         // Sound still arriving from it would start the mic's track again.
         micSource.onSamples = nil
-        queue.async { self.mixer?.remove(.mic) }
+        queue.async {
+            self.mixer?.remove(.mic)
+            self.onMicRemoved?(CACurrentMediaTime())
+        }
     }
 
     private func startCamera(_ camera: (deviceID: String?, layout: CameraLayout)?) {
@@ -490,11 +511,18 @@ final class Broadcaster: ObservableObject {
         composing.remove(quality)
         guard let canvas else { return }
         onCanvas?(canvas)
+        var failed: [SharedEncoder] = []
         for (key, shared) in encoders where key.quality == quality && shared.wantsFrames {
             // A forced keyframe the rate guard drops stays pending in the encoder.
             let force = shared.keyframeWanted
             shared.keyframeWanted = false
             shared.encoder.encode(canvas, at: CMTime(seconds: time, preferredTimescale: 1_000_000_000), forceKeyframe: force)
+            // The encoder rebuilds a broken session itself; this is when that kept failing.
+            if shared.encoder.hasFailed { failed.append(shared) }
+        }
+        // Its sites fail; sites on other encoders stream on.
+        for shared in failed {
+            for site in shared.receivers.sites { site.stop(because: "The video encoder stopped working") }
         }
     }
 
@@ -591,6 +619,7 @@ final class Broadcaster: ObservableObject {
                                                onFrame: { [queue] frame in
             queue.async { receivers.sites.forEach { $0.encoded(frame) } }
         }) else { return nil }
+        onEncoder?(encoder)
         return SharedEncoder(encoder: encoder, receivers: receivers)
     }
 

@@ -144,6 +144,8 @@ private final class FakeMic: MicSource {
     private var timer: DispatchSourceTimer?
     private let started = Locked<[(deviceID: String?, removeGameSound: Bool)]>([])
     private let stops = Locked(0)
+    /// What start reports.
+    var startState = MicInput.State.running("Stand-in")
     var startCalls: [(deviceID: String?, removeGameSound: Bool)] { started.value }
     var stopCount: Int { stops.value }
 
@@ -169,7 +171,7 @@ private final class FakeMic: MicSource {
             timer.resume()
             self.timer = timer
         }
-        onState?(.running("Stand-in"))
+        onState?(startState)
     }
 
     func stop() {
@@ -740,12 +742,16 @@ func broadcasterChecks() {
         guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
         feeder.start()
         defer { feeder.stop() }
+        let removedAt = Locked<Double?>(nil)
+        broadcaster.onMicRemoved = { time in removedAt.update { $0 = time } }
         broadcaster.goLive(micConfig(port: server.port))
         try expect(spin(timeout: 5) { broadcaster.states[.twitch] == .live }, "not live")
         spin(timeout: 1)
-        let gone = CACurrentMediaTime()
         mic.disconnect()
         try expect(spin(timeout: 2) { broadcaster.notice == "Microphone disconnected" }, "notice \(broadcaster.notice ?? "nil")")
+        // When the mixer let go of the microphone, as the broadcaster's queue saw it.
+        try expect(spin(timeout: 2) { removedAt.value != nil }, "microphone never removed from the mix")
+        let gone = removedAt.value ?? 0
         try expect(broadcaster.micState == .unavailable("Stand-in"), "state \(broadcaster.micState)")
         let before = server.received.filter { $0.type == 8 }.count
         spin(timeout: 1.5)
@@ -932,6 +938,82 @@ func broadcasterChecks() {
         feed.stop(for: .preview)
         feed.waitUntilIdle()
         try expect(ended.value == 2, "stops \(ended.value)")
+    }
+
+    check("a saved microphone that isn't there at go-live says none was found") {
+        let server = try RTMPTestServer(behaviour: .accept)
+        defer { server.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        let mic = FakeMic()
+        mic.startState = .unavailable("usb-mic")
+        broadcaster.micSource = mic
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(micConfig(port: server.port))
+        try expect(spin(timeout: 3) { broadcaster.notice == "No microphone found" }, "notice \(broadcaster.notice ?? "nil")")
+        try expect(broadcaster.isLive, "not live")
+        try ends(broadcaster)
+    }
+
+    check("a key the keychain wouldn't hand over is named as such") {
+        let broadcaster = Broadcaster(device: device, library: library)
+        broadcaster.goLive(StreamConfig(sites: [StreamSiteConfig(site: .youtube, server: "rtmp://127.0.0.1:1935/live", key: "",
+                                                                 quality: .p1080, bitrate: 0, keyUnreadable: true)],
+                                        gameVolume: 1, camera: nil, mic: nil))
+        spin(timeout: 0.1)
+        try expect(!broadcaster.isLive, "went live without a key")
+        try expect(broadcaster.notice == "Clarion couldn't read the YouTube key from the keychain", "notice \(broadcaster.notice ?? "nil")")
+    }
+
+    check("going live clears a failure left from an earlier stream on a site now off") {
+        let refusing = try RTMPTestServer(behaviour: .rejectPublish(description: "bad key"))
+        let accepting = try RTMPTestServer(behaviour: .accept)
+        defer { refusing.stop(); accepting.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(oneSite(.twitch, port: refusing.port, key: "made-up-a"))
+        try expect(spin(timeout: 5) { if case .failed = broadcaster.states[.twitch] { return true } else { return false } },
+                   "twitch \(String(describing: broadcaster.states[.twitch]))")
+        try expect(spin(timeout: 2) { !broadcaster.isLive }, "still live")
+        broadcaster.goLive(oneSite(.youtube, port: accepting.port, key: "made-up-b"))
+        try expect(broadcaster.states[.twitch] == .off, "twitch still \(String(describing: broadcaster.states[.twitch]))")
+        try expect(spin(timeout: 5) { broadcaster.states[.youtube] == .live }, "youtube not live")
+        try ends(broadcaster)
+    }
+
+    check("an encoder that can't be brought back fails its site, and the other site streams on") {
+        let a = try RTMPTestServer(behaviour: .accept), b = try RTMPTestServer(behaviour: .accept)
+        defer { a.stop(); b.stop() }
+        let broadcaster = Broadcaster(device: device, library: library)
+        // Two bitrates, so two encoders; Twitch's is made first. Limit 0.5 s, rebuilds every 0.1 s.
+        let made = Locked<[StreamVideoEncoder]>([])
+        broadcaster.onEncoder = { encoder in
+            if made.value.isEmpty {
+                encoder.recoveryTimeScale = 0.05
+                encoder.refusesRebuildForChecks = true
+            }
+            made.update { $0.append(encoder) }
+        }
+        guard let feeder = Feeder(broadcaster: broadcaster) else { throw CheckFailure(description: "no frames") }
+        feeder.start()
+        defer { feeder.stop() }
+        broadcaster.goLive(bothSites(site(.twitch, bitrate: 6_000_000, port: a.port, key: "made-up-a"),
+                                     site(.youtube, bitrate: 8_000_000, port: b.port, key: "made-up-b")))
+        try expect(spin(timeout: 5) { broadcaster.states[.twitch] == .live && broadcaster.states[.youtube] == .live },
+                   "not live: \(broadcaster.states) \(broadcaster.notice ?? "")")
+        try expect(made.value.count == 2, "\(made.value.count) encoders")
+        made.value.first?.breakSessionForChecks()
+        try expect(spin(timeout: 3) { broadcaster.states[.twitch] == .failed("The video encoder stopped working") },
+                   "twitch \(String(describing: broadcaster.states[.twitch]))")
+        let before = b.received.filter { $0.type == 9 }.count
+        spin(timeout: 0.5)
+        let after = b.received.filter { $0.type == 9 }.count
+        try expect(after >= before + 20, "youtube video \(before) -> \(after)")
+        try expect(broadcaster.states[.youtube] == .live && broadcaster.isLive, "youtube \(String(describing: broadcaster.states[.youtube]))")
+        try ends(broadcaster)
     }
 
     check("a stream that finds no camera says so, apart from a camera that was lost") {

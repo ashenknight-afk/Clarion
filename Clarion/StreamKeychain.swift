@@ -12,13 +12,25 @@ enum StreamKeychain {
     }()
 
     static func key(for site: StreamSite) -> String? {
+        read(for: site).key
+    }
+
+    /// The key, and the keychain's status: a failure other than errSecItemNotFound means a key may
+    /// be saved but couldn't be read (a denied prompt, a locked keychain).
+    static func read(for site: StreamSite) -> (key: String?, status: OSStatus) {
         var query = baseQuery(site)
         query[kSecReturnData] = true
         query[kSecMatchLimit] = kSecMatchLimitOne
         var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data, let key = String(data: data, encoding: .utf8), !key.isEmpty else { return nil }
-        return key
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess,
+              let data = result as? Data, let key = String(data: data, encoding: .utf8), !key.isEmpty else { return (nil, status) }
+        return (key, status)
+    }
+
+    /// Whether a read that gave no key failed for a reason other than there being none.
+    static func isUnreadable(_ status: OSStatus) -> Bool {
+        status != errSecSuccess && status != errSecItemNotFound
     }
 
     /// Whether a key is saved. Asks for the item's attributes only, so the key itself is not read.

@@ -130,6 +130,11 @@ struct StreamSettingsSection: View {
                 } else {
                     if let site = focusedKey { saveKey(site) }
                     broadcaster.goLive(settings.makeStreamConfig())
+                    // The test's square is drawn into the picture, so viewers would see it.
+                    if broadcaster.isLive && settings.latencyTest {
+                        settings.latencyTest = false
+                        broadcaster.show("Latency test turned off while live")
+                    }
                 }
             }
             Spacer()
@@ -157,6 +162,11 @@ struct StreamSettingsSection: View {
         DisclosureGroup("Advanced", isExpanded: $model.showAdvanced) {
             ForEach(StreamSite.allCases) { site in
                 TextField("\(site.label) server", text: server(site), prompt: Text(site.defaultServer))
+                if RTMPConnection.Target.sendsKeyInClear(server: settings.streamServer[site] ?? "") {
+                    Text("rtmp:// sends your stream key unencrypted. Use rtmps:// if the site offers it.")
+                        .font(.callout)
+                        .foregroundStyle(.yellow)
+                }
                 TextField("\(site.label) bitrate (kbps)", value: bitrateKbps(site), format: .number,
                           prompt: Text("Default"))
             }
