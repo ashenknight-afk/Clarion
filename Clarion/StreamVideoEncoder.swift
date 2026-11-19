@@ -308,7 +308,6 @@ final class StreamVideoEncoder {
         return gaveUp
     }
 
-    /// Checks only: tears the session down underneath the encoder, as a crashed encoder service would.
     /// Checks only: makes the last frame handed over look as if it has had no output for a long time.
     func stallForChecks() {
         output.lock.lock()
@@ -317,6 +316,7 @@ final class StreamVideoEncoder {
         output.lock.unlock()
     }
 
+    /// Checks only: tears the session down underneath the encoder, as a crashed encoder service would.
     func breakSessionForChecks() {
         lock.lock()
         defer { lock.unlock() }
