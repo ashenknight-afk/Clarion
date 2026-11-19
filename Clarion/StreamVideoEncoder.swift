@@ -287,9 +287,18 @@ final class StreamVideoEncoder {
     /// Failed encodes in a row that count as a broken session.
     static let failureLimit = 30
     /// Checks only: scales the recovery's times.
-    var recoveryTimeScale = 1.0
+    var recoveryTimeScale: Double {
+        get { lock.lock(); defer { lock.unlock() }; return timeScale }
+        set { lock.lock(); timeScale = newValue; lock.unlock() }
+    }
     /// Checks only: sessions made for a rebuild fail.
-    var refusesRebuildForChecks = false
+    var refusesRebuildForChecks: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return refusesRebuild }
+        set { lock.lock(); refusesRebuild = newValue; lock.unlock() }
+    }
+    // Lock: the two above.
+    private var timeScale = 1.0
+    private var refusesRebuild = false
 
     /// True once the session broke and rebuilding it hasn't brought frames back within
     /// `recoveryLimit`. The encoder then takes no more frames.
@@ -300,6 +309,14 @@ final class StreamVideoEncoder {
     }
 
     /// Checks only: tears the session down underneath the encoder, as a crashed encoder service would.
+    /// Checks only: makes the last frame handed over look as if it has had no output for a long time.
+    func stallForChecks() {
+        output.lock.lock()
+        output.pending = max(output.pending, 1)
+        output.waitingSince = ProcessInfo.processInfo.systemUptime - 1000
+        output.lock.unlock()
+    }
+
     func breakSessionForChecks() {
         lock.lock()
         defer { lock.unlock() }
@@ -428,22 +445,24 @@ final class StreamVideoEncoder {
     private func recoverIfNeeded(now: Double) {
         guard !gaveUp else { return }
         output.lock.lock()
-        let stalled = output.waitingSince.map { now - $0 > Self.rebuildInterval * recoveryTimeScale } ?? false
-        let broken = !output.closed && (output.sessionLost || output.failuresInRow >= Self.failureLimit || stalled)
+        let stalled = output.waitingSince.map { now - $0 > Self.rebuildInterval * timeScale } ?? false
+        // No session but not closed: a rebuild couldn't make one, so keep trying until the limit.
+        let broken = !output.closed
+            && (session == nil || output.sessionLost || output.failuresInRow >= Self.failureLimit || stalled)
         if broken && output.brokenSince == nil { output.brokenSince = now }
         let brokenSince = output.brokenSince
         output.lock.unlock()
         guard broken, let brokenSince else { return }
 
-        if now - brokenSince >= Self.recoveryLimit * recoveryTimeScale {
+        if now - brokenSince >= Self.recoveryLimit * timeScale {
             gaveUp = true
             dropSession()
             return
         }
         guard now >= nextRebuild else { return }
-        nextRebuild = now + Self.rebuildInterval * recoveryTimeScale
+        nextRebuild = now + Self.rebuildInterval * timeScale
         dropSession()
-        let replacement = refusesRebuildForChecks ? nil
+        let replacement = refusesRebuild ? nil
             : Self.configuredSession(width: width, height: height, bitrate: bitrate, frameRate: frameRate)
         output.lock.lock()
         output.generation += 1

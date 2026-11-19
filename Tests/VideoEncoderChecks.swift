@@ -295,6 +295,31 @@ func videoEncoderChecks() {
         encoder.invalidate()
     }
 
+    check("a stalled session whose rebuild is refused still gives up after the recovery limit") {
+        let log = FrameLog()
+        let encoder = try StreamVideoEncoder(width: width, height: height, bitrate: 6_000_000, frameRate: 60,
+                                             onFrame: { log.add($0) }).unwrapped("encoder not created")
+        // Limit 0.5 s, a rebuild at most every 0.1 s.
+        encoder.recoveryTimeScale = 0.05
+        encoder.refusesRebuildForChecks = true
+        let buffer = try movingBuffer(from: noiseRow(noiseShift: 31), index: 0).unwrapped("no buffer")
+        try expect(encoder.encode(buffer, at: .zero), "first frame refused")
+        waitUntil(timeout: 3) { !log.frames.isEmpty }
+        // As a hung encoder service: no output, no error.
+        encoder.stallForChecks()
+        let start = Date()
+        var i = 1
+        while !encoder.hasFailed && Date().timeIntervalSince(start) < 3 {
+            encoder.encode(buffer, at: CMTime(value: CMTimeValue(i), timescale: 60))
+            i += 1
+            Thread.sleep(forTimeInterval: 0.016)
+        }
+        let took = Date().timeIntervalSince(start)
+        try expect(encoder.hasFailed, "never gave up")
+        try expect(took >= 0.45 && took < 1.5, "gave up after \(took) s")
+        encoder.invalidate()
+    }
+
     check("the SPS from the FLV AVC record describes a 1920x1080 BT.709 stream") {
         let run = try encodeRun(count: 10, noiseShift: 31).unwrapped("encoder not created")
         guard let first = run.frames.first, let sps = first.sps, let pps = first.pps else {
